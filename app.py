@@ -11,16 +11,13 @@ st.set_page_config(page_title="FPL Elite Dashboard", layout="wide")
 st.markdown("""
     <style>
     [data-testid="stMetricLabel"] div, [data-testid="stMetricLabel"] p {
-        color: #111827 !important;
-        font-weight: 700 !important;
+        color: #111827 !important; font-weight: 700 !important;
     }
     .stMarkdown h3 { color: #111827 !important; }
     [data-testid="stMetricValue"] div { color: #000000 !important; }
     [data-testid="stMetric"] {
-        background-color: #ffffff !important;
-        border: 1px solid #e2e8f0 !important;
-        border-radius: 10px !important;
-        padding: 10px !important;
+        background-color: #ffffff !important; border: 1px solid #e2e8f0 !important;
+        border-radius: 10px !important; padding: 10px !important;
     }
     section[data-testid="stSidebar"] .stMarkdown p,
     section[data-testid="stSidebar"] .stMarkdown h3 { color: #ffffff !important; }
@@ -39,15 +36,21 @@ DIFF_LIGHT_TEXT = {3}
 FORM_TC_THRESHOLD = 5.0
 BLANK_FREE_HIT_THRESHOLD = 4
 DGW_BENCH_BOOST_THRESHOLD = 3
-SQUAD_OUTFIELD_SIZE = 11
 TRANSFER_BUDGET_BUFFER = 0.5
 TRANSFER_TARGET_COUNT = 8
 RADAR_METRICS = ['form', 'expected_goals', 'ict_index', 'total_points']
-
-# FPL squad composition by position name
 SQUAD_COMPOSITION = {'GKP': 2, 'DEF': 5, 'MID': 5, 'FWD': 3}
 TOTAL_BUDGET = 100.0
 HOME_CAPTAIN_BONUS = 0.5
+DIFF_MAX_OWNERSHIP = 10.0   # below this % = differential
+
+# All FPL chips and their display names
+ALL_CHIPS = {
+    'wildcard': 'Wildcard',
+    'freehit': 'Free Hit',
+    'bboost': 'Bench Boost',
+    '3xc': 'Triple Captain',
+}
 
 COLUMN_LABELS = {
     "web_name": "Player", "team_name": "Team", "pos": "Pos", "price": "£m",
@@ -55,7 +58,9 @@ COLUMN_LABELS = {
     "expected_goals": "xG", "efficiency": "Eff Score",
     "selected_by_percent": "Own%", "cost_change_event": "Price Change",
     "chance_of_playing_next_round": "Avail%", "news": "News",
-    "next_3_fixtures": "Next 3 Fix",
+    "next_3_fixtures": "Next 3 Fix", "xpts": "xPts",
+    "live_pts": "Live Pts", "live_bonus": "Bonus",
+    "live_minutes": "Mins", "diff_score": "Diff Score",
 }
 
 # ==========================================
@@ -105,6 +110,13 @@ def get_player_history(player_id):
     resp.raise_for_status()
     return resp.json()
 
+@st.cache_data(ttl=60)
+def get_live_gw_data(gw_id):
+    """Live player stats for an active gameweek. Short 60s TTL."""
+    resp = requests.get(f"{FPL_BASE_URL}event/{gw_id}/live/", timeout=REQUEST_TIMEOUT)
+    resp.raise_for_status()
+    return resp.json()
+
 try:
     data, fixtures_raw = get_fpl_data()
 except requests.RequestException as e:
@@ -118,8 +130,6 @@ pos_map = dict(zip(
     [t['id'] for t in data['element_types']],
     [t['singular_name_short'] for t in data['element_types']],
 ))
-
-# GW average scores lookup: {gw_id: average_entry_score}
 gw_averages = {e['id']: e.get('average_entry_score', 0) for e in data['events']}
 
 # ==========================================
@@ -137,14 +147,38 @@ for col in numeric_cols:
     if col in players.columns:
         players[col] = pd.to_numeric(players[col], errors='coerce').fillna(0)
 
-# chance_of_playing_next_round is null for fully fit players — default to 100, not 0
 if 'chance_of_playing_next_round' in players.columns:
     players['chance_of_playing_next_round'] = pd.to_numeric(
         players['chance_of_playing_next_round'], errors='coerce'
     ).fillna(100)
 
 # ==========================================
-# 5. HELPER FUNCTIONS
+# 5. PRE-COMPUTATION: xPts & next fixture diff
+# ==========================================
+curr_gw_event = next((e for e in data['events'] if e['is_current']), None)
+next_gw = next((e for e in data['events'] if e['is_next']), None)
+curr_gw_id = curr_gw_event['id'] if curr_gw_event else None
+next_gw_id = (curr_gw_id + 1) if curr_gw_id else None
+
+# Build next-GW difficulty per team
+_team_next_diff = {}
+if next_gw_id:
+    for f in fixtures_raw:
+        if f['event'] == next_gw_id:
+            _team_next_diff[f['team_h']] = f['team_h_difficulty']
+            _team_next_diff[f['team_a']] = f['team_a_difficulty']
+
+# xPts: form × (6 − next_diff) / 5  (blank/missing → diff=3)
+players['next_diff'] = players['team'].map(_team_next_diff).fillna(3)
+players['xpts'] = (players['form'] * (6 - players['next_diff']) / 5).round(1)
+
+# Differential score: ICT weighted by inverse of ownership (high score = hidden gem)
+players['diff_score'] = (
+    players['ict_index'] / players['selected_by_percent'].clip(lower=0.1)
+).round(1)
+
+# ==========================================
+# 6. HELPER FUNCTIONS
 # ==========================================
 def get_upcoming_fixtures(team_id, fixtures, data, num_gws=5):
     upcoming = []
@@ -169,7 +203,6 @@ def get_upcoming_fixtures(team_id, fixtures, data, num_gws=5):
     return upcoming
 
 def get_short_fixture_run(team_id, fixtures, data, num_gws=3):
-    """Returns a compact string like '2|3|BLK' for use in tables."""
     parts = []
     curr_gw = next((e['id'] for e in data['events'] if e['is_current']), None)
     if curr_gw is None:
@@ -188,7 +221,6 @@ def get_short_fixture_run(team_id, fixtures, data, num_gws=3):
     return '|'.join(parts)
 
 def fixture_difficulty_score(upcoming):
-    """Lower = easier run. BLANKs treated as 3, DGWs as 1.5."""
     total = 0
     for val in upcoming:
         if val == "BLANK":
@@ -215,7 +247,6 @@ def style_ticker(val):
     return f'background-color: {bg}; color: {text}; font-weight: bold;'
 
 def style_ticker_row(row, my_team_names):
-    """Highlight entire row if the team is in the user's squad."""
     if row['Team'] in my_team_names:
         return ['font-weight: bold; border-left: 4px solid #00ff85;'] + ['' for _ in row.index[1:]]
     return ['' for _ in row.index]
@@ -236,8 +267,31 @@ def fetch_squad_picks(manager_id, gw_id):
 def df_to_csv(df):
     return df.to_csv(index=False).encode('utf-8')
 
+def get_chip_status(used_chips):
+    """Return dict of chip_name -> GW used (or None if available)."""
+    # Each chip can only be used once, except wildcard (twice: one per half)
+    wildcard_uses = [c for c in used_chips if c['name'] == 'wildcard']
+    status = {}
+    for chip_key, chip_label in ALL_CHIPS.items():
+        uses = [c for c in used_chips if c['name'] == chip_key]
+        if chip_key == 'wildcard':
+            # Two wildcards per season
+            gws = [str(c['event']) for c in uses]
+            if len(uses) >= 2:
+                status[chip_label] = f"Used (GW{', GW'.join(gws)})"
+            elif len(uses) == 1:
+                status[chip_label] = f"1 used (GW{gws[0]}) — 1 remaining"
+            else:
+                status[chip_label] = "Available (x2)"
+        else:
+            if uses:
+                status[chip_label] = f"Used (GW{uses[0]['event']})"
+            else:
+                status[chip_label] = "Available"
+    return status
+
 # ==========================================
-# 6. SIDEBAR & LOGIC
+# 7. SIDEBAR & SQUAD LOGIC
 # ==========================================
 st.sidebar.header("Manager Settings")
 my_id = st.sidebar.text_input("Manager ID", value=st.query_params.get("id", ""))
@@ -245,9 +299,6 @@ if my_id:
     st.query_params["id"] = my_id
 
 fixture_lookahead = st.sidebar.slider("Fixture Lookahead (GWs)", min_value=3, max_value=8, value=5)
-
-next_gw = next((e for e in data['events'] if e['is_next']), None)
-curr_gw_event = next((e for e in data['events'] if e['is_current']), None)
 
 if next_gw:
     dt = pd.to_datetime(next_gw['deadline_time']).strftime('%a %d %b %H:%M')
@@ -257,7 +308,6 @@ my_player_ids, my_squad, my_picks = [], pd.DataFrame(), []
 my_team_ids = set()
 
 if my_id and curr_gw_event:
-    curr_gw_id = curr_gw_event['id']
     picks = fetch_squad_picks(my_id, curr_gw_id)
     if picks is None:
         st.sidebar.error("Could not sync squad.")
@@ -271,7 +321,6 @@ if my_id and curr_gw_event:
         picks_df = picks_df.rename(columns={'element': 'id'})
         my_squad = my_squad.merge(picks_df, on='id', how='left')
 
-        # --- Injury Alerts ---
         if 'chance_of_playing_next_round' in my_squad.columns and 'news' in my_squad.columns:
             flagged = my_squad[my_squad['news'].astype(str).str.strip() != '']
             unavailable = flagged[flagged['chance_of_playing_next_round'] == 0]
@@ -292,7 +341,6 @@ if my_id and curr_gw_event:
             gw_fixtures = [f for f in fixtures_raw if f['event'] == next_gw['id']]
             all_teams_playing = [f['team_h'] for f in gw_fixtures] + [f['team_a'] for f in gw_fixtures]
             team_counts = pd.Series(all_teams_playing).value_counts()
-
             dgw_teams = team_counts[team_counts > 1].index.tolist()
             my_dgw_players = my_squad[my_squad['team'].isin(dgw_teams)]
             active_teams = set(team_counts.index)
@@ -301,7 +349,6 @@ if my_id and curr_gw_event:
 
             if not blank_players.empty:
                 st.sidebar.warning(f"GW{next_gw['id']} Blanks: {', '.join(blank_players['web_name'].tolist())}")
-
             if blanks >= BLANK_FREE_HIT_THRESHOLD:
                 st.sidebar.error(f"Free Hit Advised! ({blanks} blanks)")
             elif not my_dgw_players.empty:
@@ -318,14 +365,14 @@ if my_id and curr_gw_event:
                 st.sidebar.info("Save Chips. No DGW/Blanks.")
 
 # ==========================================
-# 7. MAIN DASHBOARD TABS
+# 8. MAIN DASHBOARD TABS
 # ==========================================
 tabs = st.tabs([
-    "My Team", "GW History", "Global Scout", "Price Changes",
+    "My Team", "Live GW", "GW History", "Global Scout", "Price Changes",
     "Ticker", "Player VS", "Mini-League", "Rivals", "Transfers", "Wildcard"
 ])
 
-# --- TAB 0: MY TEAM ---
+# ── TAB 0: MY TEAM ──────────────────────────────────────────────────────────
 with tabs[0]:
     if not my_squad.empty:
         st.header("Squad Performance")
@@ -343,15 +390,26 @@ with tabs[0]:
         if overall_rank:
             st.caption(f"Overall Rank: {overall_rank:,}")
 
-        squad_cols = ['web_name', 'team_name', 'pos', 'price', 'form', 'total_points', 'ict_index', 'selected_by_percent']
+        squad_cols = ['web_name', 'team_name', 'pos', 'price', 'form', 'xpts', 'total_points', 'ict_index', 'selected_by_percent']
         starters = my_squad[my_squad['multiplier'] > 0].sort_values('position')
         bench = my_squad[my_squad['multiplier'] == 0].sort_values('position')
 
         st.subheader("Starting XI")
         st.dataframe(get_display_df(starters, squad_cols), use_container_width=True, hide_index=True)
+
+        # --- Bench Analysis ---
         st.subheader("Bench")
         st.dataframe(get_display_df(bench, squad_cols), use_container_width=True, hide_index=True)
 
+        bb_estimate = round(bench['form'].sum(), 1)
+        bench_season_pts = int(bench['total_points'].sum())
+        remaining_gws = (38 - curr_gw_id) if curr_gw_id else 0
+        ba1, ba2, ba3 = st.columns(3)
+        ba1.metric("Bench Season Total Pts", bench_season_pts, help="Sum of current bench players' full-season points")
+        ba2.metric("Bench Boost Value (est.)", bb_estimate, help="Sum of bench players' form — proxy for single-GW value")
+        ba3.metric("GWs Remaining", remaining_gws)
+
+        # --- Captaincy Predictor ---
         st.markdown("---")
         st.header("Captaincy Predictor")
         if next_gw:
@@ -365,7 +423,6 @@ with tabs[0]:
                 cap_df['Opp'] = cap_df['team'].apply(lambda x: opp_map.get(x, {}).get('opp', 'N/A'))
                 cap_df['Diff'] = cap_df['team'].apply(lambda x: opp_map.get(x, {}).get('diff', 3))
                 cap_df['Loc'] = cap_df['team'].apply(lambda x: opp_map.get(x, {}).get('loc', 'A'))
-                # Home bonus: home fixtures get +0.5 to captain score
                 cap_df['Score'] = (
                     cap_df['form'] +
                     (6 - cap_df['Diff']) +
@@ -385,11 +442,116 @@ with tabs[0]:
                 st.info("Fixture data pending.")
         else:
             st.info("Fixture data pending.")
+
+        # --- Chip Tracker ---
+        st.markdown("---")
+        st.header("Chip Tracker")
+        try:
+            history = get_manager_history(my_id)
+            used_chips = history.get('chips', [])
+            chip_status = get_chip_status(used_chips)
+            chip_cols = st.columns(len(chip_status))
+            for col, (chip_label, status) in zip(chip_cols, chip_status.items()):
+                is_used = status.startswith("Used (GW") or status.startswith("1 used")
+                col.metric(chip_label, status if is_used else "Available")
+        except requests.RequestException:
+            st.warning("Could not load chip data.")
+
     else:
         st.info("Enter your Manager ID in the sidebar to view your team.")
 
-# --- TAB 1: GW HISTORY ---
+# ── TAB 1: LIVE GW ──────────────────────────────────────────────────────────
 with tabs[1]:
+    st.header("Live Gameweek Tracker")
+    if curr_gw_event:
+        st.caption(f"Showing live stats for GW{curr_gw_id}. Data refreshes every 60 seconds.")
+        if st.button("Refresh live data"):
+            get_live_gw_data.clear()
+
+        try:
+            live_data = get_live_gw_data(curr_gw_id)
+            live_elements = live_data.get('elements', [])
+            live_map = {e['id']: e['stats'] for e in live_elements}
+
+            if not my_squad.empty:
+                live_squad = my_squad.copy()
+                live_squad['live_pts'] = live_squad['id'].apply(
+                    lambda pid: live_map.get(pid, {}).get('total_points', 0)
+                )
+                live_squad['live_bonus'] = live_squad['id'].apply(
+                    lambda pid: live_map.get(pid, {}).get('bonus', 0)
+                )
+                live_squad['live_minutes'] = live_squad['id'].apply(
+                    lambda pid: live_map.get(pid, {}).get('minutes', 0)
+                )
+                live_squad['live_goals'] = live_squad['id'].apply(
+                    lambda pid: live_map.get(pid, {}).get('goals_scored', 0)
+                )
+                live_squad['live_assists'] = live_squad['id'].apply(
+                    lambda pid: live_map.get(pid, {}).get('assists', 0)
+                )
+
+                # Captain gets double points
+                live_squad['effective_pts'] = live_squad.apply(
+                    lambda r: r['live_pts'] * r['multiplier'], axis=1
+                )
+
+                total_live = int(live_squad['effective_pts'].sum())
+                bench_live = int(live_squad[live_squad['multiplier'] == 0]['live_pts'].sum())
+                lv1, lv2, lv3 = st.columns(3)
+                lv1.metric("Live GW Points", total_live)
+                lv2.metric("Bench Pts (unused)", bench_live)
+                lv3.metric("GW Average", gw_averages.get(curr_gw_id, 'N/A'))
+
+                live_cols = ['web_name', 'team_name', 'pos', 'live_minutes', 'live_pts', 'live_bonus', 'live_goals', 'live_assists', 'multiplier']
+                live_rename = {
+                    'web_name': 'Player', 'team_name': 'Team', 'pos': 'Pos',
+                    'live_minutes': 'Mins', 'live_pts': 'Pts', 'live_bonus': 'Bonus',
+                    'live_goals': 'Goals', 'live_assists': 'Assists', 'multiplier': 'Mult',
+                }
+                live_starters = live_squad[live_squad['multiplier'] > 0].sort_values('position')
+                live_bench = live_squad[live_squad['multiplier'] == 0].sort_values('position')
+
+                st.subheader("Starting XI — Live")
+                display_live = live_starters[[c for c in live_cols if c in live_starters.columns]]
+                st.dataframe(display_live.rename(columns=live_rename), use_container_width=True, hide_index=True)
+
+                st.subheader("Bench — Live")
+                display_bench = live_bench[[c for c in live_cols if c in live_bench.columns]]
+                st.dataframe(display_bench.rename(columns=live_rename), use_container_width=True, hide_index=True)
+            else:
+                st.info("Enter your Manager ID in the sidebar to see live squad points.")
+
+            # All players live leaderboard
+            st.markdown("---")
+            st.subheader("Top Scoring Players This GW (Live)")
+            live_df = pd.DataFrame([
+                {'id': e['id'], 'live_pts': e['stats']['total_points'],
+                 'live_bonus': e['stats'].get('bonus', 0),
+                 'live_minutes': e['stats'].get('minutes', 0)}
+                for e in live_elements
+            ])
+            if not live_df.empty:
+                live_df = live_df.merge(players[['id', 'web_name', 'team_name', 'pos', 'price', 'selected_by_percent']], on='id', how='left')
+                top_live_cols = ['web_name', 'team_name', 'pos', 'price', 'live_pts', 'live_bonus', 'live_minutes', 'selected_by_percent']
+                top_live_rename = {
+                    'web_name': 'Player', 'team_name': 'Team', 'pos': 'Pos', 'price': '£m',
+                    'live_pts': 'GW Pts', 'live_bonus': 'Bonus', 'live_minutes': 'Mins',
+                    'selected_by_percent': 'Own%',
+                }
+                st.dataframe(
+                    live_df.sort_values('live_pts', ascending=False)
+                    .head(20)[[c for c in top_live_cols if c in live_df.columns]]
+                    .rename(columns=top_live_rename),
+                    use_container_width=True, hide_index=True,
+                )
+        except requests.RequestException:
+            st.warning("Live data unavailable. The gameweek may not have started yet.")
+    else:
+        st.info("No active gameweek found.")
+
+# ── TAB 2: GW HISTORY ───────────────────────────────────────────────────────
+with tabs[2]:
     st.header("Gameweek History & Points Trend")
     if my_id:
         try:
@@ -397,6 +559,7 @@ with tabs[1]:
             gw_history = history.get('current', [])
             if gw_history:
                 hist_df = pd.DataFrame(gw_history)
+                hist_df['gw_average'] = hist_df['event'].map(gw_averages)
 
                 h1, h2, h3, h4 = st.columns(4)
                 h1.metric("Season Total", int(hist_df['total_points'].iloc[-1]))
@@ -404,9 +567,7 @@ with tabs[1]:
                 h3.metric("Avg GW Score", round(hist_df['points'].mean(), 1))
                 h4.metric("Overall Rank", f"{hist_df['overall_rank'].iloc[-1]:,}")
 
-                # Map GW average scores onto history
-                hist_df['gw_average'] = hist_df['event'].map(gw_averages)
-
+                # Points + average overlay
                 fig = go.Figure()
                 fig.add_trace(go.Bar(
                     x=hist_df['event'], y=hist_df['points'],
@@ -431,6 +592,7 @@ with tabs[1]:
                 )
                 st.plotly_chart(fig, use_container_width=True)
 
+                # Rank chart
                 fig2 = go.Figure()
                 fig2.add_trace(go.Scatter(
                     x=hist_df['event'], y=hist_df['overall_rank'],
@@ -444,6 +606,39 @@ with tabs[1]:
                 )
                 st.plotly_chart(fig2, use_container_width=True)
 
+                # --- Position Efficiency Breakdown ---
+                st.markdown("---")
+                st.subheader("Points by Position — Current Squad")
+                if not my_squad.empty:
+                    pos_pts = (
+                        my_squad.groupby('pos')['total_points']
+                        .sum()
+                        .reset_index()
+                        .sort_values('total_points', ascending=False)
+                    )
+                    pos_count = my_squad.groupby('pos')['total_points'].count().reset_index()
+                    pos_count.columns = ['pos', 'n_players']
+                    pos_pts = pos_pts.merge(pos_count, on='pos')
+                    pos_pts['pts_per_player'] = (pos_pts['total_points'] / pos_pts['n_players']).round(1)
+
+                    fig_pos = go.Figure()
+                    fig_pos.add_trace(go.Bar(
+                        x=pos_pts['pos'], y=pos_pts['total_points'],
+                        marker_color='#38003c', name='Total Points',
+                        text=pos_pts['pts_per_player'].apply(lambda v: f"{v} pts/player"),
+                        textposition='outside',
+                    ))
+                    fig_pos.update_layout(
+                        title="Season Points by Position (current squad composition)",
+                        xaxis_title="Position", yaxis_title="Total Points",
+                        margin=dict(l=40, r=40, t=40, b=40),
+                    )
+                    st.plotly_chart(fig_pos, use_container_width=True)
+                    st.caption("Shows the season-to-date totals for your current squad players grouped by position.")
+                else:
+                    st.info("Load your squad (Manager ID) to see position breakdown.")
+
+                # GW breakdown table
                 display_cols = ['event', 'points', 'gw_average', 'total_points', 'overall_rank', 'bank', 'value', 'event_transfers', 'event_transfers_cost']
                 available = [c for c in display_cols if c in hist_df.columns]
                 rename = {
@@ -452,6 +647,7 @@ with tabs[1]:
                     'bank': 'Bank (0.1m)', 'value': 'Value (0.1m)',
                     'event_transfers': 'Transfers', 'event_transfers_cost': 'Hit Cost',
                 }
+                st.subheader("Full GW Breakdown")
                 st.dataframe(hist_df[available].rename(columns=rename), use_container_width=True, hide_index=True)
                 st.download_button(
                     "Download History CSV",
@@ -459,7 +655,7 @@ with tabs[1]:
                     file_name="gw_history.csv", mime="text/csv",
                 )
 
-                # --- Transfer History Timeline ---
+                # Transfer history
                 st.markdown("---")
                 st.subheader("Transfer History")
                 try:
@@ -474,7 +670,6 @@ with tabs[1]:
                         tf_df['Cost Out (£m)'] = tf_df['element_out_cost'].apply(lambda x: round(x / 10, 1))
                         tf_df['Current Val (£m)'] = tf_df['element_in'].map(id_to_price)
                         tf_df['Gain (£m)'] = (tf_df['Current Val (£m)'] - tf_df['Cost In (£m)']).round(1)
-
                         show_cols = ['event', 'Player In', 'Cost In (£m)', 'Current Val (£m)', 'Gain (£m)', 'Player Out', 'Cost Out (£m)']
                         available_tf = [c for c in show_cols if c in tf_df.columns]
                         st.dataframe(
@@ -497,8 +692,8 @@ with tabs[1]:
     else:
         st.info("Enter your Manager ID in the sidebar.")
 
-# --- TAB 2: GLOBAL SCOUT ---
-with tabs[2]:
+# ── TAB 3: GLOBAL SCOUT ─────────────────────────────────────────────────────
+with tabs[3]:
     st.header("Global Player Scout")
     s1, s2, s3, s4 = st.columns(4)
     with s1:
@@ -517,7 +712,7 @@ with tabs[2]:
         (players['team_name'].isin(t_filt))
     ].copy()
 
-    scout_cols = ['web_name', 'team_name', 'pos', 'price', 'total_points', 'form', 'ict_index', 'selected_by_percent']
+    scout_cols = ['web_name', 'team_name', 'pos', 'price', 'xpts', 'total_points', 'form', 'ict_index', 'selected_by_percent']
     sorted_scout = scout_df.sort_values('total_points', ascending=False)
     st.dataframe(get_display_df(sorted_scout, scout_cols), use_container_width=True, hide_index=True)
     st.download_button(
@@ -526,24 +721,67 @@ with tabs[2]:
         file_name="player_scout.csv", mime="text/csv",
     )
 
+    # --- Value vs Points Scatter ---
+    st.markdown("---")
+    st.subheader("Value vs Points — Bubble Chart")
+    st.caption("Bubble size = ownership %. Players in the top-left are high value for money.")
+    scatter_df = scout_df.dropna(subset=['price', 'total_points', 'selected_by_percent'])
+    fig_scatter = go.Figure()
+    for pos_name, color in [('GKP', '#38003c'), ('DEF', '#00753e'), ('MID', '#01fc7a'), ('FWD', '#ff1751')]:
+        subset = scatter_df[scatter_df['pos'] == pos_name]
+        if subset.empty:
+            continue
+        fig_scatter.add_trace(go.Scatter(
+            x=subset['price'],
+            y=subset['total_points'],
+            mode='markers',
+            name=pos_name,
+            marker=dict(
+                size=subset['selected_by_percent'].clip(lower=1) * 1.5,
+                color=color,
+                opacity=0.7,
+                sizemode='area',
+            ),
+            text=subset['web_name'] + '<br>Own: ' + subset['selected_by_percent'].astype(str) + '%',
+            hovertemplate='%{text}<br>£%{x}m | %{y} pts<extra></extra>',
+        ))
+    fig_scatter.update_layout(
+        xaxis_title="Price (£m)", yaxis_title="Total Points",
+        legend=dict(orientation='h'), margin=dict(l=40, r=40, t=20, b=40),
+    )
+    st.plotly_chart(fig_scatter, use_container_width=True)
+
+    # --- Differential Finder ---
+    st.markdown("---")
+    st.subheader("Differential Finder")
+    st.caption(f"High ICT players owned by fewer than {DIFF_MAX_OWNERSHIP}% of managers. Sorted by differential score (ICT / ownership).")
+    diff_max_own = st.slider("Max Ownership %", 2.0, 20.0, float(DIFF_MAX_OWNERSHIP), step=1.0, key="diff_own")
+    diffs = players[players['selected_by_percent'] <= diff_max_own].copy()
+    diffs['diff_score'] = (diffs['ict_index'] / diffs['selected_by_percent'].clip(lower=0.1)).round(1)
+    diff_cols = ['web_name', 'team_name', 'pos', 'price', 'selected_by_percent', 'form', 'ict_index', 'xpts', 'diff_score']
+    st.dataframe(
+        get_display_df(diffs.nlargest(20, 'diff_score'), diff_cols),
+        use_container_width=True, hide_index=True,
+    )
+
     # --- Template Comparison ---
     st.markdown("---")
     st.subheader("FPL Template Comparison")
     st.caption("Top 30 most-owned players globally vs your squad.")
     template = players.nlargest(30, 'selected_by_percent')[
-        ['web_name', 'team_name', 'pos', 'price', 'selected_by_percent', 'total_points', 'form']
+        ['web_name', 'team_name', 'pos', 'price', 'selected_by_percent', 'xpts', 'total_points', 'form']
     ].copy()
     if not my_squad.empty:
         template['In Your Squad'] = template['web_name'].isin(my_squad['web_name']).map({True: 'Yes', False: 'No'})
         owned_count = template['In Your Squad'].eq('Yes').sum()
         st.caption(f"You own {owned_count}/30 template players.")
     st.dataframe(
-        get_display_df(template, ['web_name', 'team_name', 'pos', 'price', 'selected_by_percent', 'total_points', 'form']),
+        get_display_df(template, ['web_name', 'team_name', 'pos', 'price', 'selected_by_percent', 'xpts', 'total_points', 'form']),
         use_container_width=True, hide_index=True,
     )
 
-# --- TAB 3: PRICE CHANGES ---
-with tabs[3]:
+# ── TAB 4: PRICE CHANGES ────────────────────────────────────────────────────
+with tabs[4]:
     st.header("Price Change Tracker")
     st.caption("Based on `cost_change_event` (this GW) and `cost_change_start` (vs. season start).")
     pc1, pc2 = st.columns(2)
@@ -556,6 +794,7 @@ with tabs[3]:
         st.subheader("Falling — This GW")
         falling = players[players['cost_change_event'] < 0].sort_values('cost_change_event')
         st.dataframe(get_display_df(falling, rising_cols), use_container_width=True, hide_index=True)
+
     st.markdown("---")
     st.subheader("Biggest Movers Since Season Start")
     movers = players.copy()
@@ -564,8 +803,27 @@ with tabs[3]:
     mover_cols = ['web_name', 'team_name', 'pos', 'price', 'cost_change_start', 'form', 'selected_by_percent']
     st.dataframe(get_display_df(movers, mover_cols), use_container_width=True, hide_index=True)
 
-# --- TAB 4: TICKER ---
-with tabs[4]:
+    # --- Price Rise Predictor ---
+    st.markdown("---")
+    st.subheader("Price Rise Predictor")
+    st.caption(
+        "Players with high/rising ownership but no price change yet this GW. "
+        "Heavy net transfers-in pushes price up — these are candidates for an imminent rise."
+    )
+    # Proxy: highly owned players who haven't risen this GW, sorted by ownership %
+    no_change = players[(players['cost_change_event'] == 0) & (players['selected_by_percent'] > 5)].copy()
+    # Use transfers_in_event / transfers_out_event if available as a signal
+    if 'transfers_in_event' in no_change.columns and 'transfers_out_event' in no_change.columns:
+        no_change['net_transfers'] = no_change['transfers_in_event'] - no_change['transfers_out_event']
+        rise_candidates = no_change.sort_values('net_transfers', ascending=False).head(20)
+        rise_cols = ['web_name', 'team_name', 'pos', 'price', 'selected_by_percent', 'net_transfers', 'form']
+    else:
+        rise_candidates = no_change.sort_values('selected_by_percent', ascending=False).head(20)
+        rise_cols = ['web_name', 'team_name', 'pos', 'price', 'selected_by_percent', 'form']
+    st.dataframe(get_display_df(rise_candidates, rise_cols), use_container_width=True, hide_index=True)
+
+# ── TAB 5: TICKER ───────────────────────────────────────────────────────────
+with tabs[5]:
     st.header("Fixture Difficulty Ticker")
     sort_by_difficulty = st.toggle("Sort by Easiest Run", value=False)
 
@@ -594,8 +852,8 @@ with tabs[4]:
     if sort_by_difficulty:
         st.caption("Run Score = sum of difficulty ratings (lower = easier). Blanks=3, DGWs=1.5.")
 
-# --- TAB 5: PLAYER VS ---
-with tabs[5]:
+# ── TAB 6: PLAYER VS ────────────────────────────────────────────────────────
+with tabs[6]:
     st.header("Player VS Radar")
     search_mode = st.toggle("Search by player name", value=False)
 
@@ -634,7 +892,7 @@ with tabs[5]:
         st.plotly_chart(fig_v, use_container_width=True)
 
         st.subheader("Stats Comparison")
-        compare_cols = ['web_name', 'team_name', 'pos', 'price', 'form', 'total_points', 'ict_index', 'expected_goals', 'selected_by_percent']
+        compare_cols = ['web_name', 'team_name', 'pos', 'price', 'form', 'xpts', 'total_points', 'ict_index', 'expected_goals', 'selected_by_percent']
         p1_row = players[(players['web_name'] == p1) & (players['team_name'] == tm1)]
         p2_row = players[(players['web_name'] == p2) & (players['team_name'] == tm2)]
         st.dataframe(get_display_df(pd.concat([p1_row, p2_row]), compare_cols), use_container_width=True, hide_index=True)
@@ -663,13 +921,14 @@ with tabs[5]:
         )
         st.plotly_chart(gw_fig, use_container_width=True)
 
-# --- TAB 6: MINI-LEAGUE ---
-with tabs[6]:
+# ── TAB 7: MINI-LEAGUE ──────────────────────────────────────────────────────
+with tabs[7]:
     st.header("Mini-League Standings")
     league_type = st.radio("League Type", ["Classic", "Head-to-Head"], horizontal=True)
     league_id = st.text_input("Enter League ID", value=st.query_params.get("league", ""), key="league_input")
     if league_id:
         st.query_params["league"] = league_id
+
     if league_id:
         try:
             if league_type == "Classic":
@@ -678,8 +937,10 @@ with tabs[6]:
                 league_name = league_data.get('league', {}).get('name', 'League')
                 if results:
                     league_df = pd.DataFrame(results)
-                    col_map = {'rank': 'Rank', 'entry_name': 'Team Name', 'player_name': 'Manager',
-                               'event_total': 'GW Score', 'total': 'Total Pts', 'last_rank': 'Last Rank'}
+                    col_map = {
+                        'rank': 'Rank', 'entry_name': 'Team Name', 'player_name': 'Manager',
+                        'event_total': 'GW Score', 'total': 'Total Pts', 'last_rank': 'Last Rank',
+                    }
                     available = [c for c in col_map if c in league_df.columns]
                     league_display = league_df[available].rename(columns=col_map)
                     if 'last_rank' in league_df.columns and 'rank' in league_df.columns:
@@ -690,10 +951,36 @@ with tabs[6]:
                     st.dataframe(league_display, use_container_width=True, hide_index=True)
                     st.download_button("Download Standings CSV", df_to_csv(league_display),
                                        file_name=f"{league_name}_standings.csv", mime="text/csv")
+
+                    # --- Mini-League Form Table (last 5 GWs) ---
+                    st.markdown("---")
+                    st.subheader("Form Table — Last 5 Gameweeks")
+                    st.caption("Fetches history for each manager. Limited to 20 managers.")
+                    if st.button("Load form data", key="load_form"):
+                        manager_entries = league_df[['entry', 'entry_name']].head(20).to_dict('records')
+                        form_rows = []
+                        prog = st.progress(0, text="Fetching manager histories…")
+                        for i, mgr in enumerate(manager_entries):
+                            try:
+                                h = get_manager_history(str(mgr['entry']))
+                                gws = h.get('current', [])
+                                last5 = sorted(gws, key=lambda x: x['event'])[-5:]
+                                row = {'Team': mgr['entry_name']}
+                                for gw_entry in last5:
+                                    row[f"GW{gw_entry['event']}"] = gw_entry['points']
+                                form_rows.append(row)
+                            except requests.RequestException:
+                                pass
+                            prog.progress((i + 1) / len(manager_entries))
+                        prog.empty()
+                        if form_rows:
+                            form_df = pd.DataFrame(form_rows).set_index('Team')
+                            st.dataframe(form_df, use_container_width=True)
+                        else:
+                            st.warning("Could not load form data.")
                 else:
                     st.info("No standings data found.")
             else:
-                # Head-to-Head
                 h2h_data = get_h2h_standings(league_id)
                 results = h2h_data.get('standings', {}).get('results', [])
                 league_name = h2h_data.get('league', {}).get('name', 'H2H League')
@@ -715,51 +1002,76 @@ with tabs[6]:
         except requests.RequestException:
             st.error("League not found or is private. Check the League ID.")
 
-# --- TAB 7: RIVALS ---
-with tabs[7]:
+# ── TAB 8: RIVALS ───────────────────────────────────────────────────────────
+with tabs[8]:
     st.header("Rival Deep-Dive")
     rival_id = st.text_input("Enter Rival Manager ID", value=st.query_params.get("rival", ""), key="riv_input")
     if rival_id:
         st.query_params["rival"] = rival_id
+
     if my_id and rival_id and curr_gw_event:
-        picks = fetch_squad_picks(rival_id, curr_gw_event['id'])
+        picks = fetch_squad_picks(rival_id, curr_gw_id)
         if picks is None:
             st.error("Rival ID not found or request failed.")
         else:
             riv_ids = [p['element'] for p in picks]
             my_set, riv_set = set(my_player_ids), set(riv_ids)
             riv_cols = ['web_name', 'team_name', 'price', 'total_points', 'form', 'ict_index', 'expected_goals', 'selected_by_percent']
+
             st.subheader("Shield (Shared Assets)")
             st.dataframe(get_display_df(players[players['id'].isin(my_set & riv_set)], riv_cols), use_container_width=True, hide_index=True)
             st.subheader("Your Sword (Differentials)")
             st.dataframe(get_display_df(players[players['id'].isin(my_set - riv_set)], riv_cols), use_container_width=True, hide_index=True)
             st.subheader("Danger (Rival Differentials)")
             st.dataframe(get_display_df(players[players['id'].isin(riv_set - my_set)], riv_cols), use_container_width=True, hide_index=True)
+
+            # --- Rival Rank History ---
+            st.markdown("---")
+            st.subheader("Rank History — You vs Rival")
+            try:
+                my_hist = get_manager_history(my_id)
+                riv_hist = get_manager_history(rival_id)
+                my_gws = pd.DataFrame(my_hist.get('current', []))[['event', 'overall_rank']]
+                riv_gws = pd.DataFrame(riv_hist.get('current', []))[['event', 'overall_rank']]
+                fig_rank = go.Figure()
+                fig_rank.add_trace(go.Scatter(
+                    x=my_gws['event'], y=my_gws['overall_rank'],
+                    name='Your Rank', line=dict(color='#00ff85', width=2),
+                ))
+                fig_rank.add_trace(go.Scatter(
+                    x=riv_gws['event'], y=riv_gws['overall_rank'],
+                    name='Rival Rank', line=dict(color='#ff1751', width=2, dash='dash'),
+                ))
+                fig_rank.update_layout(
+                    title="Overall Rank — You vs Rival (lower = better)",
+                    xaxis_title="Gameweek",
+                    yaxis=dict(title="Rank", autorange='reversed'),
+                    legend=dict(orientation='h'),
+                    margin=dict(l=40, r=40, t=40, b=40),
+                )
+                st.plotly_chart(fig_rank, use_container_width=True)
+            except (requests.RequestException, KeyError):
+                st.warning("Could not load rank history for one or both managers.")
+
     elif rival_id and not curr_gw_event:
         st.warning("No current gameweek found.")
     elif not my_id:
         st.info("Enter your Manager ID in the sidebar to compare squads.")
 
-# --- TAB 8: TRANSFERS ---
-with tabs[8]:
+# ── TAB 9: TRANSFERS ────────────────────────────────────────────────────────
+with tabs[9]:
     st.header("Transfer Optimizer")
     if not my_squad.empty:
         my_squad['efficiency'] = (my_squad['form'] + (my_squad['total_points'] / my_squad['price'])).round(1)
         num_ft = st.radio("Free Transfers Available", options=[1, 2, "Wildcard"], horizontal=True)
         n_transfers = 2 if num_ft == "Wildcard" else int(num_ft)
 
-        sorted_squad = my_squad.sort_values('efficiency')
-        candidates = sorted_squad.head(n_transfers)
-
+        candidates = my_squad.sort_values('efficiency').head(n_transfers)
         st.subheader("Drop Candidates")
-        drop_cols = ['web_name', 'team_name', 'pos', 'price', 'form', 'efficiency', 'selected_by_percent']
+        drop_cols = ['web_name', 'team_name', 'pos', 'price', 'form', 'xpts', 'efficiency', 'selected_by_percent']
         st.dataframe(get_display_df(candidates, drop_cols), use_container_width=True, hide_index=True)
 
         st.subheader("Recommended Replacements (per candidate)")
-
-        # Build a team_id lookup for fixture runs
-        team_name_to_id = dict(zip(teams['name'], teams['id']))
-
         for _, worst in candidates.iterrows():
             with st.expander(f"Replace {worst['web_name']} (£{worst['price']}m | Eff: {worst['efficiency']})"):
                 bud = worst['price'] + (2.0 if num_ft == "Wildcard" else TRANSFER_BUDGET_BUFFER)
@@ -769,12 +1081,10 @@ with tabs[8]:
                     (~players['id'].isin(my_player_ids))
                 ].nlargest(TRANSFER_TARGET_COUNT, 'ict_index').copy()
 
-                # Add 3-GW fixture difficulty for each target
                 targets['next_3_fixtures'] = targets['team'].apply(
                     lambda tid: get_short_fixture_run(tid, fixtures_raw, data, num_gws=3)
                 )
-
-                t_cols = ['web_name', 'team_name', 'price', 'form', 'ict_index', 'expected_goals', 'total_points', 'selected_by_percent', 'next_3_fixtures']
+                t_cols = ['web_name', 'team_name', 'price', 'form', 'xpts', 'ict_index', 'expected_goals', 'total_points', 'selected_by_percent', 'next_3_fixtures']
                 display = get_display_df(targets, t_cols)
                 st.dataframe(display, use_container_width=True, hide_index=True)
                 st.download_button(
@@ -787,13 +1097,12 @@ with tabs[8]:
     else:
         st.info("Enter your Manager ID in the sidebar to use the Transfer Optimizer.")
 
-# --- TAB 9: WILDCARD PLANNER ---
-with tabs[9]:
+# ── TAB 10: WILDCARD ────────────────────────────────────────────────────────
+with tabs[10]:
     st.header("Wildcard Planner")
     st.caption("Build an optimal squad within budget. Pin players you want to keep, then find the best options for remaining slots.")
 
     wc_budget = st.number_input("Total Budget (£m)", min_value=90.0, max_value=105.0, value=TOTAL_BUDGET, step=0.5)
-
     all_player_names = sorted(players['web_name'].unique())
     pinned_names = st.multiselect(
         "Pin players to keep",
@@ -805,18 +1114,18 @@ with tabs[9]:
     pinned_df = players[players['web_name'].isin(pinned_names)].drop_duplicates('web_name')
     pinned_cost = pinned_df['price'].sum()
     remaining_budget = round(wc_budget - pinned_cost, 1)
-
     pinned_counts = pinned_df['pos'].value_counts().to_dict()
     slots_remaining = {pos: total - pinned_counts.get(pos, 0) for pos, total in SQUAD_COMPOSITION.items()}
 
-    b1, b2 = st.columns(2)
+    b1, b2, b3 = st.columns(3)
     b1.metric("Remaining Budget", f"£{remaining_budget}m")
     b2.metric("Pinned Players", len(pinned_df))
+    b3.metric("Slots to Fill", sum(max(s, 0) for s in slots_remaining.values()))
 
     if pinned_names:
         st.subheader("Pinned Players")
         st.dataframe(
-            get_display_df(pinned_df, ['web_name', 'team_name', 'pos', 'price', 'form', 'ict_index', 'total_points']),
+            get_display_df(pinned_df, ['web_name', 'team_name', 'pos', 'price', 'form', 'xpts', 'ict_index', 'total_points']),
             use_container_width=True, hide_index=True,
         )
 
@@ -824,20 +1133,19 @@ with tabs[9]:
     if remaining_budget < 0:
         st.error("Pinned players exceed your budget. Remove some to continue.")
     else:
+        total_open_slots = sum(max(s, 0) for s in slots_remaining.values())
         for pos, slots in slots_remaining.items():
             if slots <= 0:
                 continue
             with st.expander(f"{pos} — {slots} slot(s) remaining"):
-                # Budget per slot: split remaining evenly as a soft guide
-                slot_budget = round(remaining_budget / max(sum(slots_remaining.values()), 1) * slots, 1)
+                slot_budget = round(remaining_budget / max(total_open_slots, 1) * slots, 1)
                 candidates_wc = players[
                     (players['pos'] == pos) &
                     (~players['web_name'].isin(pinned_names))
                 ].nlargest(10, 'ict_index').copy()
-
                 candidates_wc['next_3_fixtures'] = candidates_wc['team'].apply(
                     lambda tid: get_short_fixture_run(tid, fixtures_raw, data, num_gws=3)
                 )
-                wc_cols = ['web_name', 'team_name', 'price', 'form', 'ict_index', 'total_points', 'selected_by_percent', 'next_3_fixtures']
+                wc_cols = ['web_name', 'team_name', 'price', 'form', 'xpts', 'ict_index', 'total_points', 'selected_by_percent', 'next_3_fixtures']
                 st.dataframe(get_display_df(candidates_wc, wc_cols), use_container_width=True, hide_index=True)
-                st.caption(f"Suggested budget for {slots} {pos} slot(s): £{slot_budget}m")
+                st.caption(f"Suggested budget allocation for {slots} {pos} slot(s): £{slot_budget}m")
