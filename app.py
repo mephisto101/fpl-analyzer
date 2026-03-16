@@ -268,7 +268,12 @@ if my_id and curr_gw_event:
             my_dgw_players = my_squad[my_squad['team'].isin(dgw_teams)]
 
             active_teams = set(team_counts.index)
-            blanks = SQUAD_OUTFIELD_SIZE - len(my_squad[my_squad['team'].isin(active_teams)])
+            blank_players = my_squad[~my_squad['team'].isin(active_teams)]
+            blanks = len(blank_players)
+
+            if not blank_players.empty:
+                blank_names = ', '.join(blank_players['web_name'].tolist())
+                st.sidebar.warning(f"GW{next_gw['id']} Blanks: {blank_names}")
 
             if blanks >= BLANK_FREE_HIT_THRESHOLD:
                 st.sidebar.error(f"Free Hit Advised! ({blanks} blanks)")
