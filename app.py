@@ -61,6 +61,10 @@ COLUMN_LABELS = {
     "next_3_fixtures": "Next 3 Fix", "xpts": "xPts",
     "live_pts": "Live Pts", "live_bonus": "Bonus",
     "live_minutes": "Mins", "diff_score": "Diff Score",
+    "ppm": "PPM", "net_transfers": "Net Transf",
+    "avg_minutes": "Avg Mins", "form_trend": "Form Trend",
+    "cs_prob": "CS%", "rotation_risk": "Rot. Risk",
+    "season_ppg": "PPG",
 }
 
 # ==========================================
@@ -142,6 +146,8 @@ numeric_cols = [
     'expected_goals', 'expected_assists', 'ict_index', 'form',
     'total_points', 'minutes', 'selected_by_percent',
     'cost_change_event', 'cost_change_start',
+    'threat', 'creativity', 'influence',
+    'transfers_in_event', 'transfers_out_event',
 ]
 for col in numeric_cols:
     if col in players.columns:
@@ -176,6 +182,29 @@ players['xpts'] = (players['form'] * (6 - players['next_diff']) / 5).round(1)
 players['diff_score'] = (
     players['ict_index'] / players['selected_by_percent'].clip(lower=0.1)
 ).round(1)
+
+# Points per million
+players['ppm'] = (players['total_points'] / players['price'].clip(lower=0.1)).round(1)
+
+# Net transfers this GW
+if 'transfers_in_event' in players.columns and 'transfers_out_event' in players.columns:
+    players['net_transfers'] = (
+        players['transfers_in_event'] - players['transfers_out_event']
+    ).astype(int)
+
+# Average minutes per GW and rotation risk flag
+_games_played = max(curr_gw_id or 1, 1)
+players['avg_minutes'] = (players['minutes'] / _games_played).round(0).astype(int)
+players['rotation_risk'] = players['avg_minutes'].apply(lambda m: 'Low mins' if m < 55 else '')
+
+# Season points-per-game and form trend (positive = in form vs season average)
+players['season_ppg'] = (players['total_points'] / _games_played).round(1)
+players['form_trend'] = (players['form'] - players['season_ppg']).round(1)
+
+# Clean sheet probability estimate for DEF/GKP (rough: harder fixture = less likely CS)
+players['cs_prob'] = players['next_diff'].apply(
+    lambda d: f"{max(0, round((6 - d) / 10 * 100))}%"
+)
 
 # ==========================================
 # 6. HELPER FUNCTIONS
@@ -300,6 +329,16 @@ if my_id:
 
 fixture_lookahead = st.sidebar.slider("Fixture Lookahead (GWs)", min_value=3, max_value=8, value=5)
 
+with st.sidebar.expander("Advanced Thresholds"):
+    FORM_TC_THRESHOLD = st.slider("TC Form Min", 3.0, 9.0, FORM_TC_THRESHOLD, step=0.5,
+                                  help="Minimum form score to suggest Triple Captain")
+    BLANK_FREE_HIT_THRESHOLD = st.slider("FH Blank Threshold", 2, 6, BLANK_FREE_HIT_THRESHOLD,
+                                         help="Blanked players needed to suggest Free Hit")
+    DGW_BENCH_BOOST_THRESHOLD = st.slider("BB DGW Players", 2, 5, DGW_BENCH_BOOST_THRESHOLD,
+                                           help="DGW players on bench to suggest Bench Boost")
+    DIFF_MAX_OWNERSHIP = st.slider("Differential Cutoff %", 1.0, 20.0, float(DIFF_MAX_OWNERSHIP), step=1.0,
+                                   help="Ownership threshold for differential status")
+
 if next_gw:
     dt = pd.to_datetime(next_gw['deadline_time']).strftime('%a %d %b %H:%M')
     st.sidebar.success(f"GW{next_gw['id']} Deadline: {dt}")
@@ -390,7 +429,7 @@ with tabs[0]:
         if overall_rank:
             st.caption(f"Overall Rank: {overall_rank:,}")
 
-        squad_cols = ['web_name', 'team_name', 'pos', 'price', 'form', 'xpts', 'total_points', 'ict_index', 'selected_by_percent']
+        squad_cols = ['web_name', 'team_name', 'pos', 'price', 'form', 'form_trend', 'xpts', 'ppm', 'total_points', 'ict_index', 'avg_minutes', 'rotation_risk', 'selected_by_percent']
         starters = my_squad[my_squad['multiplier'] > 0].sort_values('position')
         bench = my_squad[my_squad['multiplier'] == 0].sort_values('position')
 
@@ -409,6 +448,28 @@ with tabs[0]:
         ba2.metric("Bench Boost Value (est.)", bb_estimate, help="Sum of bench players' form — proxy for single-GW value")
         ba3.metric("GWs Remaining", remaining_gws)
 
+        # --- Form vs Season Average Chart ---
+        st.markdown("---")
+        st.subheader("Form vs Season Average")
+        st.caption("Bar chart comparing each player's recent form (last 5 GW avg) against their season points-per-game.")
+        _squad_sorted = my_squad.sort_values('pos')
+        fig_form_avg = go.Figure()
+        fig_form_avg.add_trace(go.Bar(
+            x=_squad_sorted['web_name'], y=_squad_sorted['form'],
+            name='Recent Form (last 5 GW avg)', marker_color='#38003c',
+        ))
+        fig_form_avg.add_trace(go.Bar(
+            x=_squad_sorted['web_name'], y=_squad_sorted['season_ppg'],
+            name='Season Avg Pts/GW', marker_color='#01fc7a',
+            opacity=0.75,
+        ))
+        fig_form_avg.update_layout(
+            barmode='group', xaxis_title='Player', yaxis_title='Points',
+            xaxis_tickangle=-35, legend=dict(orientation='h'),
+            margin=dict(l=40, r=40, t=20, b=100),
+        )
+        st.plotly_chart(fig_form_avg, use_container_width=True)
+
         # --- Captaincy Predictor ---
         st.markdown("---")
         st.header("Captaincy Predictor")
@@ -423,11 +484,18 @@ with tabs[0]:
                 cap_df['Opp'] = cap_df['team'].apply(lambda x: opp_map.get(x, {}).get('opp', 'N/A'))
                 cap_df['Diff'] = cap_df['team'].apply(lambda x: opp_map.get(x, {}).get('diff', 3))
                 cap_df['Loc'] = cap_df['team'].apply(lambda x: opp_map.get(x, {}).get('loc', 'A'))
+                # Enhanced formula: Form 45% + ICT (normalised) 30% + Fixture 20% + Home 5%
+                _max_ict = float(players['ict_index'].max()) or 1.0
+                cap_df['ict_norm'] = (cap_df['ict_index'].astype(float) / _max_ict * 10).round(1)
                 cap_df['Score'] = (
-                    cap_df['form'] +
-                    (6 - cap_df['Diff']) +
+                    cap_df['form'] * 0.45 +
+                    cap_df['ict_norm'] * 0.30 +
+                    (6 - cap_df['Diff']) * 0.20 +
                     cap_df['Loc'].apply(lambda loc: HOME_CAPTAIN_BONUS if loc == 'H' else 0)
-                ).round(1)
+                ).round(2)
+                cap_df['Tier'] = cap_df['Score'].apply(
+                    lambda s: 'A — Strong' if s > 4 else ('B — Solid' if s >= 2.5 else 'C — Risky')
+                )
 
                 c_cols = st.columns(3)
                 for i, (_, row) in enumerate(cap_df.nlargest(3, 'Score').iterrows()):
@@ -438,6 +506,7 @@ with tabs[0]:
                         color = "green" if d <= 2 else "orange" if d <= 3 else "red"
                         st.markdown(f"Difficulty: :{color}[Level {d}]")
                         st.metric("Cap Score", row['Score'])
+                        st.caption(f"Tier: {row['Tier']}  |  ICT norm: {row['ict_norm']}")
             except (KeyError, ValueError):
                 st.info("Fixture data pending.")
         else:
@@ -655,6 +724,35 @@ with tabs[2]:
                     file_name="gw_history.csv", mime="text/csv",
                 )
 
+                # --- Hit Cost Impact Chart ---
+                if 'event_transfers_cost' in hist_df.columns:
+                    st.markdown("---")
+                    st.subheader("Transfer Hit Cost Analysis")
+                    hist_df['cumulative_hit_cost'] = hist_df['event_transfers_cost'].cumsum()
+                    total_hit_pts = int(hist_df['event_transfers_cost'].sum())
+                    hc1, hc2 = st.columns(2)
+                    hc1.metric("Total Hit Cost (pts)", total_hit_pts)
+                    hc2.metric("Hits Taken", int((hist_df['event_transfers_cost'] > 0).sum()))
+                    fig_hits = go.Figure()
+                    fig_hits.add_trace(go.Bar(
+                        x=hist_df['event'], y=hist_df['event_transfers_cost'],
+                        name='Hit Cost per GW', marker_color='#ff1751', opacity=0.85,
+                    ))
+                    fig_hits.add_trace(go.Scatter(
+                        x=hist_df['event'], y=hist_df['cumulative_hit_cost'],
+                        name='Cumulative Hit Cost', yaxis='y2',
+                        line=dict(color='#38003c', width=2),
+                    ))
+                    fig_hits.update_layout(
+                        title="Transfer Hit Costs Over Season",
+                        xaxis_title="Gameweek",
+                        yaxis=dict(title="Hit Cost (pts)"),
+                        yaxis2=dict(title="Cumulative Cost", overlaying='y', side='right'),
+                        legend=dict(orientation='h'),
+                        margin=dict(l=40, r=40, t=40, b=40),
+                    )
+                    st.plotly_chart(fig_hits, use_container_width=True)
+
                 # Transfer history
                 st.markdown("---")
                 st.subheader("Transfer History")
@@ -712,8 +810,18 @@ with tabs[3]:
         (players['team_name'].isin(t_filt))
     ].copy()
 
-    scout_cols = ['web_name', 'team_name', 'pos', 'price', 'xpts', 'total_points', 'form', 'ict_index', 'selected_by_percent']
-    sorted_scout = scout_df.sort_values('total_points', ascending=False)
+    _sort_opts = {
+        'Total Points': 'total_points', 'xPts (next GW)': 'xpts', 'Form': 'form',
+        'ICT Index': 'ict_index', 'PPM': 'ppm', 'Net Transfers (GW)': 'net_transfers',
+        'Form Trend': 'form_trend',
+    }
+    _net_avail = 'net_transfers' in scout_df.columns
+    _sort_keys = [k for k in _sort_opts if k != 'Net Transfers (GW)' or _net_avail]
+    scout_sort = st.selectbox("Sort by", _sort_keys, index=0, key="scout_sort")
+    scout_cols = ['web_name', 'team_name', 'pos', 'price', 'xpts', 'ppm', 'total_points', 'form', 'form_trend', 'ict_index', 'selected_by_percent']
+    if _net_avail:
+        scout_cols.insert(-1, 'net_transfers')
+    sorted_scout = scout_df.sort_values(_sort_opts[scout_sort], ascending=False)
     st.dataframe(get_display_df(sorted_scout, scout_cols), use_container_width=True, hide_index=True)
     st.download_button(
         "Download Scout CSV",
@@ -763,6 +871,21 @@ with tabs[3]:
         get_display_df(diffs.nlargest(20, 'diff_score'), diff_cols),
         use_container_width=True, hide_index=True,
     )
+
+    # --- Hot & Cold Form ---
+    st.markdown("---")
+    st.subheader("Hot & Cold Players")
+    st.caption("Form trend = recent form minus season points-per-game. Positive = in form, negative = cold.")
+    hc_cols = ['web_name', 'team_name', 'pos', 'price', 'form', 'season_ppg', 'form_trend', 'xpts', 'selected_by_percent']
+    hc1, hc2 = st.columns(2)
+    with hc1:
+        st.markdown("**Hottest Players (form above season avg)**")
+        hot_df = scout_df[scout_df['form_trend'] > 0].nlargest(10, 'form_trend')
+        st.dataframe(get_display_df(hot_df, hc_cols), use_container_width=True, hide_index=True)
+    with hc2:
+        st.markdown("**Coldest Players (form below season avg)**")
+        cold_df = scout_df[scout_df['form_trend'] < 0].nsmallest(10, 'form_trend')
+        st.dataframe(get_display_df(cold_df, hc_cols), use_container_width=True, hide_index=True)
 
     # --- Template Comparison ---
     st.markdown("---")
@@ -825,6 +948,39 @@ with tabs[4]:
 # ── TAB 5: TICKER ───────────────────────────────────────────────────────────
 with tabs[5]:
     st.header("Fixture Difficulty Ticker")
+
+    # --- DGW / Blank Early Warning Panel ---
+    st.subheader("DGW / Blank Early Warning — Next 10 GWs")
+    _base_gw = (curr_gw_id or 0) + 1
+    _all_team_ids = set(team_map.keys())
+    _warning_rows = []
+    for _gw in range(_base_gw, _base_gw + 10):
+        _gw_fixtures = [f for f in fixtures_raw if f['event'] == _gw]
+        if not _gw_fixtures:
+            break
+        _teams_in_gw = pd.Series(
+            [f['team_h'] for f in _gw_fixtures] + [f['team_a'] for f in _gw_fixtures]
+        ).value_counts()
+        _dgw = [team_map[t] for t in _teams_in_gw[_teams_in_gw > 1].index]
+        _blank = [team_map[t] for t in _all_team_ids if t not in _teams_in_gw.index]
+        _warning_rows.append({
+            'GW': _gw,
+            'DGW Teams': ', '.join(sorted(_dgw)) if _dgw else '—',
+            '# DGW': len(_dgw),
+            'Blank Teams': ', '.join(sorted(_blank)) if _blank else '—',
+            '# Blank': len(_blank),
+        })
+    if _warning_rows:
+        _warn_df = pd.DataFrame(_warning_rows)
+        st.dataframe(_warn_df, use_container_width=True, hide_index=True)
+        _next_dgw = next((_r for _r in _warning_rows if _r['# DGW'] > 0), None)
+        _next_blank = next((_r for _r in _warning_rows if _r['# Blank'] > 0), None)
+        if _next_dgw:
+            st.info(f"Next DGW: GW{_next_dgw['GW']} — {_next_dgw['DGW Teams']}")
+        if _next_blank:
+            st.warning(f"Next Blank GW: GW{_next_blank['GW']} — {_next_blank['Blank Teams']}")
+    st.markdown("---")
+
     sort_by_difficulty = st.toggle("Sort by Easiest Run", value=False)
 
     my_team_names = set(my_squad['team_name'].tolist()) if not my_squad.empty else set()
@@ -1066,9 +1222,14 @@ with tabs[9]:
         num_ft = st.radio("Free Transfers Available", options=[1, 2, "Wildcard"], horizontal=True)
         n_transfers = 2 if num_ft == "Wildcard" else int(num_ft)
 
+        # Rotation risk in squad: flag players averaging < 55 min
+        _rot_risk_players = my_squad[my_squad['rotation_risk'] == 'Low mins']['web_name'].tolist()
+        if _rot_risk_players:
+            st.warning(f"Rotation risk (low avg mins): {', '.join(_rot_risk_players)}")
+
         candidates = my_squad.sort_values('efficiency').head(n_transfers)
         st.subheader("Drop Candidates")
-        drop_cols = ['web_name', 'team_name', 'pos', 'price', 'form', 'xpts', 'efficiency', 'selected_by_percent']
+        drop_cols = ['web_name', 'team_name', 'pos', 'price', 'form', 'xpts', 'ppm', 'efficiency', 'avg_minutes', 'rotation_risk', 'selected_by_percent']
         st.dataframe(get_display_df(candidates, drop_cols), use_container_width=True, hide_index=True)
 
         st.subheader("Recommended Replacements (per candidate)")
@@ -1084,7 +1245,11 @@ with tabs[9]:
                 targets['next_3_fixtures'] = targets['team'].apply(
                     lambda tid: get_short_fixture_run(tid, fixtures_raw, data, num_gws=3)
                 )
-                t_cols = ['web_name', 'team_name', 'price', 'form', 'xpts', 'ict_index', 'expected_goals', 'total_points', 'selected_by_percent', 'next_3_fixtures']
+                # For defenders/keepers, include CS probability
+                is_def_gkp = worst['pos'] in ('DEF', 'GKP')
+                t_cols = ['web_name', 'team_name', 'price', 'form', 'xpts', 'ppm', 'ict_index', 'expected_goals', 'total_points', 'avg_minutes', 'selected_by_percent', 'next_3_fixtures']
+                if is_def_gkp:
+                    t_cols.insert(-1, 'cs_prob')
                 display = get_display_df(targets, t_cols)
                 st.dataframe(display, use_container_width=True, hide_index=True)
                 st.download_button(
@@ -1146,6 +1311,8 @@ with tabs[10]:
                 candidates_wc['next_3_fixtures'] = candidates_wc['team'].apply(
                     lambda tid: get_short_fixture_run(tid, fixtures_raw, data, num_gws=3)
                 )
-                wc_cols = ['web_name', 'team_name', 'price', 'form', 'xpts', 'ict_index', 'total_points', 'selected_by_percent', 'next_3_fixtures']
+                wc_cols = ['web_name', 'team_name', 'price', 'form', 'xpts', 'ppm', 'ict_index', 'total_points', 'avg_minutes', 'selected_by_percent', 'next_3_fixtures']
+                if pos in ('DEF', 'GKP'):
+                    wc_cols.insert(-1, 'cs_prob')
                 st.dataframe(get_display_df(candidates_wc, wc_cols), use_container_width=True, hide_index=True)
                 st.caption(f"Suggested budget allocation for {slots} {pos} slot(s): £{slot_budget}m")
