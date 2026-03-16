@@ -90,6 +90,12 @@ def get_manager_history(manager_id):
     return resp.json()
 
 @st.cache_data(ttl=300)
+def get_manager_entry(manager_id):
+    resp = requests.get(f"{FPL_BASE_URL}entry/{manager_id}/", timeout=REQUEST_TIMEOUT)
+    resp.raise_for_status()
+    return resp.json()
+
+@st.cache_data(ttl=300)
 def get_league_standings(league_id):
     resp = requests.get(f"{FPL_BASE_URL}leagues-classic/{league_id}/standings/", timeout=REQUEST_TIMEOUT)
     resp.raise_for_status()
@@ -118,11 +124,17 @@ players['price'] = players['now_cost'] / 10
 numeric_cols = [
     'expected_goals', 'expected_assists', 'ict_index', 'form',
     'total_points', 'minutes', 'selected_by_percent',
-    'cost_change_event', 'cost_change_start', 'chance_of_playing_next_round',
+    'cost_change_event', 'cost_change_start',
 ]
 for col in numeric_cols:
     if col in players.columns:
         players[col] = pd.to_numeric(players[col], errors='coerce').fillna(0)
+
+# chance_of_playing_next_round is null for fully fit players — default to 100, not 0
+if 'chance_of_playing_next_round' in players.columns:
+    players['chance_of_playing_next_round'] = pd.to_numeric(
+        players['chance_of_playing_next_round'], errors='coerce'
+    ).fillna(100)
 
 # ==========================================
 # 5. HELPER FUNCTIONS
@@ -227,12 +239,14 @@ if my_id and curr_gw_event:
         my_squad = my_squad.merge(picks_df, on='id', how='left')
 
         # --- Injury Alerts ---
-        if 'chance_of_playing_next_round' in my_squad.columns:
-            injured = my_squad[
-                (my_squad['chance_of_playing_next_round'] < 75) &
-                (my_squad['chance_of_playing_next_round'] > 0)
+        # Only flag players that FPL has explicitly flagged (non-empty news field)
+        if 'chance_of_playing_next_round' in my_squad.columns and 'news' in my_squad.columns:
+            flagged = my_squad[my_squad['news'].astype(str).str.strip() != '']
+            unavailable = flagged[flagged['chance_of_playing_next_round'] == 0]
+            injured = flagged[
+                (flagged['chance_of_playing_next_round'] > 0) &
+                (flagged['chance_of_playing_next_round'] < 75)
             ]
-            unavailable = my_squad[my_squad['chance_of_playing_next_round'] == 0]
 
             if not unavailable.empty:
                 names = ', '.join(unavailable['web_name'].tolist())
@@ -285,10 +299,18 @@ with tabs[0]:
     if not my_squad.empty:
         st.header("Squad Performance")
         m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Total Pts", int(my_squad['total_points'].sum()))
+        try:
+            entry = get_manager_entry(my_id)
+            overall_pts = entry.get('summary_overall_points', 'N/A')
+            overall_rank = entry.get('summary_overall_rank', None)
+        except requests.RequestException:
+            overall_pts, overall_rank = 'N/A', None
+        m1.metric("Overall Pts", overall_pts)
         m2.metric("Squad xG", round(my_squad['expected_goals'].sum(), 2))
         m3.metric("Avg Form", round(my_squad['form'].mean(), 1))
         m4.metric("Squad Value", f"£{my_squad['price'].sum():.1f}m")
+        if overall_rank:
+            st.caption(f"Overall Rank: {overall_rank:,}")
 
         squad_cols = ['web_name', 'team_name', 'pos', 'price', 'form', 'total_points', 'ict_index', 'selected_by_percent']
 
