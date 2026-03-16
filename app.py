@@ -570,7 +570,9 @@ with tabs[5]:
 # --- TAB 6: MINI-LEAGUE ---
 with tabs[6]:
     st.header("Mini-League Standings")
-    league_id = st.text_input("Enter League ID", key="league_input")
+    league_id = st.text_input("Enter League ID", value=st.query_params.get("league", ""), key="league_input")
+    if league_id:
+        st.query_params["league"] = league_id
     if league_id:
         try:
             league_data = get_league_standings(league_id)
@@ -613,7 +615,9 @@ with tabs[6]:
 # --- TAB 7: RIVALS ---
 with tabs[7]:
     st.header("Rival Deep-Dive")
-    rival_id = st.text_input("Enter Rival Manager ID", key="riv_input")
+    rival_id = st.text_input("Enter Rival Manager ID", value=st.query_params.get("rival", ""), key="riv_input")
+    if rival_id:
+        st.query_params["rival"] = rival_id
     if my_id and rival_id and curr_gw_event:
         picks = fetch_squad_picks(rival_id, curr_gw_event['id'])
         if picks is None:
