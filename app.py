@@ -1265,54 +1265,191 @@ with tabs[9]:
 # ── TAB 10: WILDCARD ────────────────────────────────────────────────────────
 with tabs[10]:
     st.header("Wildcard Planner")
-    st.caption("Build an optimal squad within budget. Pin players you want to keep, then find the best options for remaining slots.")
 
-    wc_budget = st.number_input("Total Budget (£m)", min_value=90.0, max_value=105.0, value=TOTAL_BUDGET, step=0.5)
-    all_player_names = sorted(players['web_name'].unique())
-    pinned_names = st.multiselect(
-        "Pin players to keep",
-        options=all_player_names,
-        default=[],
-        help="These players will be locked in. Budget and slots are calculated around them.",
-    )
+    # ── Controls row ────────────────────────────────────────────────────────
+    wc_ctrl1, wc_ctrl2, wc_ctrl3, wc_ctrl4 = st.columns([2, 1, 1, 1])
+    with wc_ctrl1:
+        wc_budget = st.number_input(
+            "Total Budget (£m)", min_value=90.0, max_value=105.0, value=TOTAL_BUDGET, step=0.5,
+        )
+    with wc_ctrl2:
+        if not my_squad.empty:
+            if st.button("Pre-fill from my squad", use_container_width=True,
+                         help="Load your current squad into the builder"):
+                st.session_state['wc_gkp'] = my_squad[my_squad['pos'] == 'GKP']['web_name'].tolist()[:2]
+                st.session_state['wc_def'] = my_squad[my_squad['pos'] == 'DEF']['web_name'].tolist()[:5]
+                st.session_state['wc_mid'] = my_squad[my_squad['pos'] == 'MID']['web_name'].tolist()[:5]
+                st.session_state['wc_fwd'] = my_squad[my_squad['pos'] == 'FWD']['web_name'].tolist()[:3]
+                st.rerun()
+        else:
+            st.caption("Enter Manager ID to pre-fill")
+    with wc_ctrl3:
+        if st.button("Clear squad", use_container_width=True):
+            for _k in ['wc_gkp', 'wc_def', 'wc_mid', 'wc_fwd']:
+                st.session_state[_k] = []
+            st.rerun()
 
-    pinned_df = players[players['web_name'].isin(pinned_names)].drop_duplicates('web_name')
-    pinned_cost = pinned_df['price'].sum()
-    remaining_budget = round(wc_budget - pinned_cost, 1)
-    pinned_counts = pinned_df['pos'].value_counts().to_dict()
-    slots_remaining = {pos: total - pinned_counts.get(pos, 0) for pos, total in SQUAD_COMPOSITION.items()}
+    # ── Position selectors ──────────────────────────────────────────────────
+    st.markdown("---")
+    st.subheader("Pick Your 15")
+    st.caption("Select players position by position. The budget bar and squad metrics update live.")
 
-    b1, b2, b3 = st.columns(3)
-    b1.metric("Remaining Budget", f"£{remaining_budget}m")
-    b2.metric("Pinned Players", len(pinned_df))
-    b3.metric("Slots to Fill", sum(max(s, 0) for s in slots_remaining.values()))
+    _by_pos = {p: sorted(players[players['pos'] == p]['web_name'].unique()) for p in ['GKP', 'DEF', 'MID', 'FWD']}
 
-    if pinned_names:
-        st.subheader("Pinned Players")
-        st.dataframe(
-            get_display_df(pinned_df, ['web_name', 'team_name', 'pos', 'price', 'form', 'xpts', 'ict_index', 'total_points']),
-            use_container_width=True, hide_index=True,
+    sel_col1, sel_col2 = st.columns(2)
+    with sel_col1:
+        selected_gkp = st.multiselect(
+            "Goalkeepers — pick 2", options=_by_pos['GKP'], max_selections=2, key='wc_gkp',
+        )
+        selected_def = st.multiselect(
+            "Defenders — pick 5", options=_by_pos['DEF'], max_selections=5, key='wc_def',
+        )
+    with sel_col2:
+        selected_mid = st.multiselect(
+            "Midfielders — pick 5", options=_by_pos['MID'], max_selections=5, key='wc_mid',
+        )
+        selected_fwd = st.multiselect(
+            "Forwards — pick 3", options=_by_pos['FWD'], max_selections=3, key='wc_fwd',
         )
 
-    st.subheader("Best Available for Remaining Slots")
-    if remaining_budget < 0:
-        st.error("Pinned players exceed your budget. Remove some to continue.")
-    else:
-        total_open_slots = sum(max(s, 0) for s in slots_remaining.values())
-        for pos, slots in slots_remaining.items():
-            if slots <= 0:
+    # ── Budget & completion status ──────────────────────────────────────────
+    _wc_all = selected_gkp + selected_def + selected_mid + selected_fwd
+    wc_squad_df = players[players['web_name'].isin(_wc_all)].drop_duplicates('web_name').copy()
+    _wc_cost = round(wc_squad_df['price'].sum(), 1) if not wc_squad_df.empty else 0.0
+    _wc_remaining = round(wc_budget - _wc_cost, 1)
+    _wc_slots_filled = len(_wc_all)
+    _wc_gws_left = (38 - curr_gw_id) if curr_gw_id else 0
+
+    st.markdown("---")
+    # Budget progress bar
+    _bar_pct = min(_wc_cost / wc_budget, 1.0)
+    _bar_label = f"Budget used: £{_wc_cost:.1f}m of £{wc_budget:.1f}m"
+    st.progress(_bar_pct, text=_bar_label)
+
+    # Status metrics
+    stat1, stat2, stat3, stat4, stat5 = st.columns(5)
+    stat1.metric("Remaining Budget", f"£{_wc_remaining}m",
+                 delta=f"{'over' if _wc_remaining < 0 else 'free'}")
+    stat2.metric("Players Selected", f"{_wc_slots_filled} / 15")
+    stat3.metric("GWs Remaining", _wc_gws_left)
+    if not wc_squad_df.empty:
+        stat4.metric("Squad xPts", round(wc_squad_df['xpts'].sum(), 1))
+        stat5.metric("Avg PPM", round(wc_squad_df['ppm'].mean(), 1))
+
+    # Position completion chips
+    pos_st1, pos_st2, pos_st3, pos_st4 = st.columns(4)
+    for _col, _pos, _sel, _target in [
+        (pos_st1, "GKP", selected_gkp, 2), (pos_st2, "DEF", selected_def, 5),
+        (pos_st3, "MID", selected_mid, 5), (pos_st4, "FWD", selected_fwd, 3),
+    ]:
+        _n = len(_sel)
+        _label = f"{_pos}  {_n}/{_target}"
+        _delta = "complete" if _n == _target else f"{_target - _n} more needed"
+        _col.metric(_label, "", delta=_delta, delta_color="normal" if _n == _target else "inverse")
+
+    if _wc_remaining < 0:
+        st.error(f"Over budget by £{abs(_wc_remaining):.1f}m — swap out a player to fix this.")
+    elif _wc_slots_filled == 15:
+        st.success(f"Squad complete! £{_wc_remaining:.1f}m in the bank.")
+
+    # ── Squad summary ───────────────────────────────────────────────────────
+    if not wc_squad_df.empty:
+        st.markdown("---")
+        st.subheader("Squad Summary")
+
+        # Per-position cost breakdown
+        _pos_cost = wc_squad_df.groupby('pos')['price'].agg(['sum', 'mean', 'count']).reset_index()
+        _pos_cost.columns = ['Pos', 'Total £m', 'Avg £m', 'Players']
+        _pos_cost['Total £m'] = _pos_cost['Total £m'].round(1)
+        _pos_cost['Avg £m'] = _pos_cost['Avg £m'].round(1)
+        pc1, pc2 = st.columns([1, 2])
+        with pc1:
+            st.markdown("**Budget by position**")
+            st.dataframe(_pos_cost, use_container_width=True, hide_index=True)
+        with pc2:
+            _pos_order = ['GKP', 'DEF', 'MID', 'FWD']
+            _cost_ordered = _pos_cost.set_index('Pos').reindex(_pos_order).dropna()
+            fig_wc_budget = go.Figure(go.Bar(
+                x=_cost_ordered.index, y=_cost_ordered['Total £m'],
+                marker_color=['#38003c', '#00753e', '#01fc7a', '#ff1751'],
+                text=_cost_ordered['Total £m'].apply(lambda v: f"£{v}m"),
+                textposition='outside',
+            ))
+            fig_wc_budget.update_layout(
+                yaxis_title="£m", margin=dict(l=20, r=20, t=20, b=20),
+                showlegend=False,
+            )
+            st.plotly_chart(fig_wc_budget, use_container_width=True)
+
+        # Squad rows by position
+        _sq_display_cols = ['web_name', 'team_name', 'price', 'form', 'xpts', 'ppm', 'ict_index', 'total_points', 'avg_minutes', 'next_3_fixtures']
+        for _pos_label in ['GKP', 'DEF', 'MID', 'FWD']:
+            _pos_df = wc_squad_df[wc_squad_df['pos'] == _pos_label].copy()
+            if _pos_df.empty:
                 continue
-            with st.expander(f"{pos} — {slots} slot(s) remaining"):
-                slot_budget = round(remaining_budget / max(total_open_slots, 1) * slots, 1)
-                candidates_wc = players[
-                    (players['pos'] == pos) &
-                    (~players['web_name'].isin(pinned_names))
-                ].nlargest(10, 'ict_index').copy()
-                candidates_wc['next_3_fixtures'] = candidates_wc['team'].apply(
-                    lambda tid: get_short_fixture_run(tid, fixtures_raw, data, num_gws=3)
-                )
-                wc_cols = ['web_name', 'team_name', 'price', 'form', 'xpts', 'ppm', 'ict_index', 'total_points', 'avg_minutes', 'selected_by_percent', 'next_3_fixtures']
-                if pos in ('DEF', 'GKP'):
-                    wc_cols.insert(-1, 'cs_prob')
-                st.dataframe(get_display_df(candidates_wc, wc_cols), use_container_width=True, hide_index=True)
-                st.caption(f"Suggested budget allocation for {slots} {pos} slot(s): £{slot_budget}m")
+            _pos_df['next_3_fixtures'] = _pos_df['team'].apply(
+                lambda tid: get_short_fixture_run(tid, fixtures_raw, data, num_gws=3)
+            )
+            _cols = _sq_display_cols[:]
+            if _pos_label in ('GKP', 'DEF'):
+                _cols.insert(-1, 'cs_prob')
+            _pos_total = _pos_df['price'].sum()
+            st.markdown(f"**{_pos_label}** — {len(_pos_df)} players · £{_pos_total:.1f}m")
+            st.dataframe(get_display_df(_pos_df, _cols), use_container_width=True, hide_index=True)
+
+        st.download_button(
+            "Download Squad CSV",
+            df_to_csv(get_display_df(
+                wc_squad_df,
+                ['web_name', 'team_name', 'pos', 'price', 'form', 'xpts', 'ppm', 'total_points'],
+            )),
+            file_name="wildcard_squad.csv", mime="text/csv",
+        )
+
+    # ── Player Browser ──────────────────────────────────────────────────────
+    st.markdown("---")
+    st.subheader("Player Browser")
+    st.caption("Research players by position before adding them in the selectors above.")
+
+    pb1, pb2, pb3, pb4 = st.columns(4)
+    with pb1:
+        browser_pos = st.radio("Position", ['GKP', 'DEF', 'MID', 'FWD'], horizontal=True, key="wc_pb_pos")
+    with pb2:
+        _pos_max = float(players[players['pos'] == browser_pos]['price'].max())
+        browser_max_price = st.slider(
+            "Max Price (£m)", 3.5, _pos_max, min(_pos_max, 8.0), step=0.5, key="wc_pb_price",
+        )
+    with pb3:
+        browser_sort = st.selectbox(
+            "Sort by", ['xPts', 'PPM', 'Form', 'ICT', 'Total Pts', 'Ownership %'],
+            key="wc_pb_sort",
+        )
+    with pb4:
+        hide_picked = st.checkbox("Hide already selected", value=True, key="wc_pb_hide")
+
+    _pb_sort_map = {
+        'xPts': 'xpts', 'PPM': 'ppm', 'Form': 'form',
+        'ICT': 'ict_index', 'Total Pts': 'total_points', 'Ownership %': 'selected_by_percent',
+    }
+    browser_df = players[
+        (players['pos'] == browser_pos) &
+        (players['price'] <= browser_max_price)
+    ].copy()
+    if hide_picked:
+        browser_df = browser_df[~browser_df['web_name'].isin(_wc_all)]
+
+    browser_df['next_3_fixtures'] = browser_df['team'].apply(
+        lambda tid: get_short_fixture_run(tid, fixtures_raw, data, num_gws=3)
+    )
+    _pb_cols = ['web_name', 'team_name', 'price', 'form', 'xpts', 'ppm', 'ict_index',
+                'total_points', 'avg_minutes', 'selected_by_percent', 'next_3_fixtures']
+    if browser_pos in ('GKP', 'DEF'):
+        _pb_cols.insert(-1, 'cs_prob')
+
+    st.dataframe(
+        get_display_df(
+            browser_df.sort_values(_pb_sort_map[browser_sort], ascending=False).head(30),
+            _pb_cols,
+        ),
+        use_container_width=True, hide_index=True,
+    )
