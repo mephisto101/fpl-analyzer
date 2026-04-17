@@ -1,1 +1,36 @@
+## Python
 __pycache__/
+*.py[cod]
+*.pyd
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+
+## Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+## Testing / tooling
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.pytype/
+.coverage
+coverage.xml
+htmlcov/
+
+## Editors / OS
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini
+
+## Streamlit
+.streamlit/
+
+## App local data
+.watchlist.json
