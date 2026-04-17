@@ -34,10 +34,12 @@ st.markdown("""
     section[data-testid="stSidebar"] {
         background: #0b1220 !important;
     }
-    /* Slightly wider sidebar so tiles don't truncate */
-    section[data-testid="stSidebar"], section[data-testid="stSidebar"] > div {
-        width: 26rem !important;
-        min-width: 26rem !important;
+    /* Wider sidebar on desktop only (mobile must stay fluid) */
+    @media (min-width: 1100px) {
+        section[data-testid="stSidebar"], section[data-testid="stSidebar"] > div {
+            width: 26rem !important;
+            min-width: 26rem !important;
+        }
     }
     section[data-testid="stSidebar"] * {
         color: #e5e7eb;
@@ -79,6 +81,39 @@ st.markdown("""
     section[data-testid="stSidebar"] .block-container {
         padding-top: 1.25rem !important;
         padding-bottom: 1.25rem !important;
+    }
+
+    /* =========================
+       Mobile responsiveness
+       ========================= */
+    @media (max-width: 768px) {
+        /* Stack Streamlit columns vertically */
+        div[data-testid="stHorizontalBlock"] {
+            flex-wrap: wrap !important;
+        }
+        div[data-testid="stHorizontalBlock"] > div {
+            width: 100% !important;
+            flex: 1 1 100% !important;
+            min-width: 100% !important;
+        }
+
+        /* Reduce padding and type scale */
+        .block-container {
+            padding-left: 0.9rem !important;
+            padding-right: 0.9rem !important;
+        }
+        section[data-testid="stSidebar"] .block-container {
+            padding-left: 0.9rem !important;
+            padding-right: 0.9rem !important;
+        }
+        section[data-testid="stSidebar"] [data-testid="stMetricValue"] div {
+            font-size: 1.35rem !important;
+        }
+
+        /* Make dataframes usable on small screens */
+        div[data-testid="stDataFrame"] {
+            overflow-x: auto !important;
+        }
     }
     </style>
     """, unsafe_allow_html=True)
