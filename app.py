@@ -4,13 +4,146 @@ import requests
 import plotly.graph_objects as go
 import json
 from pathlib import Path
-from fpl.logic import (
-    add_estimated_effective_ownership,
-    build_captaincy_matrix,
-    build_weekly_plan_markdown,
-    compute_shield_attack_scores,
-    optimize_starting_xi,
-)
+import importlib
+
+_logic = None
+try:
+    _logic = importlib.import_module("fpl.logic")
+except Exception:
+    _logic = None
+
+optimize_starting_xi = getattr(_logic, "optimize_starting_xi", None) if _logic else None
+build_captaincy_matrix = getattr(_logic, "build_captaincy_matrix", None) if _logic else None
+add_estimated_effective_ownership = getattr(_logic, "add_estimated_effective_ownership", None) if _logic else None
+compute_shield_attack_scores = getattr(_logic, "compute_shield_attack_scores", None) if _logic else None
+build_weekly_plan_markdown = getattr(_logic, "build_weekly_plan_markdown", None) if _logic else None
+
+if optimize_starting_xi is None:
+    def optimize_starting_xi(squad, *, score_col, pos_col="pos"):
+        if squad.empty:
+            return squad.copy(), squad.copy()
+        fallback = squad.copy()
+        fallback["_score"] = pd.to_numeric(fallback.get(score_col, 0), errors="coerce").fillna(0.0)
+        xi = fallback.sort_values("_score", ascending=False).head(11).drop(columns=["_score"], errors="ignore")
+        bench = fallback.drop(index=xi.index).sort_values("_score", ascending=False).drop(columns=["_score"], errors="ignore")
+        return xi.reset_index(drop=True), bench.reset_index(drop=True)
+
+if build_captaincy_matrix is None:
+    def build_captaincy_matrix(squad, *, max_ict, home_bonus=0.5):
+        if squad.empty:
+            return squad.copy()
+        cap = squad.copy()
+        safe_max_ict = max(float(max_ict or 1.0), 1.0)
+        cap["ict_norm"] = (pd.to_numeric(cap.get("ict_index", 0), errors="coerce").fillna(0.0) / safe_max_ict * 10).round(1)
+        cap["Score"] = (
+            pd.to_numeric(cap.get("form", 0), errors="coerce").fillna(0.0) * 0.45
+            + cap["ict_norm"] * 0.30
+            + (6 - pd.to_numeric(cap.get("Diff", 3), errors="coerce").fillna(3.0)) * 0.20
+            + cap.get("Loc", "A").astype(str).eq("H").astype(float) * float(home_bonus)
+        ).round(2)
+        cap["Confidence"] = (
+            pd.to_numeric(cap.get("play_prob", 0.75), errors="coerce").fillna(0.75).clip(0, 1) * 100
+        ).round(0).astype(int)
+        cap["Confidence Tier"] = cap["Confidence"].apply(lambda c: "High" if c >= 80 else ("Medium" if c >= 60 else "Low"))
+        cap["Reason Codes"] = "BALANCED"
+        cap["Why Not"] = "Narrowly behind the top pick on blended rank score."
+        cap["Tier"] = cap["Score"].apply(lambda s: "A — Strong" if s > 4 else ("B — Solid" if s >= 2.5 else "C — Risky"))
+        cap["proj_pts"] = pd.to_numeric(cap.get("proj_pts", 0), errors="coerce").fillna(0.0)
+        cap["Captain Rank Score"] = (cap["Score"] * 0.6 + cap["proj_pts"] * 0.4).round(2)
+        return cap.sort_values("Captain Rank Score", ascending=False).reset_index(drop=True)
+
+if add_estimated_effective_ownership is None:
+    def add_estimated_effective_ownership(players_df, *, captain_ids=None):
+        if players_df.empty:
+            return players_df.copy()
+        out = players_df.copy()
+        out["selected_by_percent"] = pd.to_numeric(out.get("selected_by_percent", 0), errors="coerce").fillna(0.0)
+        out["play_prob"] = pd.to_numeric(out.get("play_prob", 1.0), errors="coerce").fillna(1.0).clip(0, 1)
+        out["proj_pts"] = pd.to_numeric(out.get("proj_pts", 0), errors="coerce").fillna(0.0)
+        out["est_eo"] = (out["selected_by_percent"] * out["play_prob"]).round(1)
+        cids = {int(x) for x in (captain_ids or set())}
+        if cids and "id" in out.columns:
+            out.loc[out["id"].astype(int).isin(cids), "est_eo"] = (
+                out.loc[out["id"].astype(int).isin(cids), "est_eo"] * 2
+            ).round(1)
+        out["est_eo"] = out["est_eo"].clip(lower=0, upper=200)
+        out["attack_index"] = (out["proj_pts"] * (1 - out["est_eo"] / 100.0)).round(2)
+        return out
+
+if compute_shield_attack_scores is None:
+    def compute_shield_attack_scores(players_with_eo, *, squad_player_ids, top_n=15, differential_eo_cap=20.0):
+        if players_with_eo.empty or "id" not in players_with_eo.columns:
+            return {
+                "shield_score": 0.0,
+                "attack_score": 0.0,
+                "core_owned_count": 0,
+                "core_total_count": int(top_n),
+                "core_dangers": pd.DataFrame(),
+                "attack_assets": pd.DataFrame(),
+            }
+        p = players_with_eo.copy()
+        p["id"] = pd.to_numeric(p["id"], errors="coerce").fillna(-1).astype(int)
+        p["est_eo"] = pd.to_numeric(p.get("est_eo", 0), errors="coerce").fillna(0.0)
+        p["attack_index"] = pd.to_numeric(p.get("attack_index", 0), errors="coerce").fillna(0.0)
+        p["proj_pts"] = pd.to_numeric(p.get("proj_pts", 0), errors="coerce").fillna(0.0)
+        core = p.sort_values("est_eo", ascending=False).head(int(top_n)).copy()
+        core["owned"] = core["id"].isin({int(x) for x in squad_player_ids})
+        core_owned = core[core["owned"]]
+        core_dangers = core[~core["owned"]].copy()
+        shield_eo = float(core_owned["est_eo"].sum())
+        danger_eo = float(core_dangers["est_eo"].sum())
+        total_core = shield_eo + danger_eo
+        shield_score = round((shield_eo / total_core) * 100, 1) if total_core > 0 else 0.0
+        attack_assets = p[
+            p["id"].isin({int(x) for x in squad_player_ids}) & (p["est_eo"] <= float(differential_eo_cap))
+        ].copy()
+        attack_assets = attack_assets.sort_values("attack_index", ascending=False)
+        attack_max = float(attack_assets["proj_pts"].sum())
+        attack_raw = float(attack_assets["attack_index"].sum())
+        attack_score = round((attack_raw / attack_max) * 100, 1) if attack_max > 0 else 0.0
+        return {
+            "shield_score": shield_score,
+            "attack_score": attack_score,
+            "core_owned_count": int(core_owned.shape[0]),
+            "core_total_count": int(core.shape[0]),
+            "core_dangers": core_dangers.reset_index(drop=True),
+            "attack_assets": attack_assets.reset_index(drop=True),
+        }
+
+if build_weekly_plan_markdown is None:
+    def build_weekly_plan_markdown(
+        *,
+        gw_id,
+        captain,
+        vice_captain,
+        xi_names,
+        bench_names,
+        transfer_note,
+        chip_note,
+        risk_notes=None,
+    ):
+        gw_label = f"GW{gw_id}" if gw_id else "Next GW"
+        c_name = captain.get("web_name") if captain else "TBD"
+        vc_name = vice_captain.get("web_name") if vice_captain else "TBD"
+        c_opp = captain.get("Opp", "N/A") if captain else "N/A"
+        vc_opp = vice_captain.get("Opp", "N/A") if vice_captain else "N/A"
+        lines = [
+            f"## {gw_label} Weekly Plan",
+            "",
+            f"- **Captain:** {c_name} (vs {c_opp})",
+            f"- **Vice-captain:** {vc_name} (vs {vc_opp})",
+            f"- **Suggested XI:** {', '.join(xi_names) if xi_names else 'N/A'}",
+            f"- **Bench order:** {', '.join(bench_names) if bench_names else 'N/A'}",
+            f"- **Transfer idea:** {transfer_note}",
+            f"- **Chip strategy:** {chip_note}",
+            "- **Key risks:**",
+        ]
+        risks = [r for r in (risk_notes or []) if str(r).strip()]
+        if risks:
+            lines.extend([f"  - {r}" for r in risks])
+        else:
+            lines.append("  - No major red flags detected.")
+        return "\n".join(lines) + "\n"
 
 # ==========================================
 # 1. PAGE CONFIGURATION & CSS
