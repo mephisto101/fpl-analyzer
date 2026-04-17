@@ -5,6 +5,14 @@ import plotly.graph_objects as go
 import json
 from pathlib import Path
 
+from fpl.logic import (
+    build_one_click_plan_markdown,
+    captain_confidence,
+    captain_reason_breakdown,
+    eo_risk_panel,
+    why_not_notes,
+)
+
 # ==========================================
 # 1. PAGE CONFIGURATION & CSS
 # ==========================================
@@ -167,6 +175,10 @@ COLUMN_LABELS = {
     "proj_pts": "Projected Points",
     "set_pieces": "Set Pieces",
     "pens": "Penalties",
+    "threat_score": "Threat Score",
+    "in_squad": "In Squad",
+    "confidence_tier": "Confidence Tier",
+    "confidence_flags": "Uncertainty Flags",
 }
 
 LOCAL_SETTINGS_PATH = ".local_settings.json"
@@ -850,6 +862,9 @@ with tabs[0]:
                 # Add projections + a confidence proxy
                 cap_df = add_projection_columns(cap_df, horizon_gws=2)
                 cap_df["Confidence"] = (cap_df["play_prob"] * 100).round(0).astype(int)
+                _conf = cap_df.apply(lambda r: captain_confidence(r), axis=1, result_type="expand")
+                cap_df["confidence_tier"] = _conf[0]
+                cap_df["confidence_flags"] = _conf[1].apply(lambda xs: ", ".join(xs) if xs else "—")
 
                 c_cols = st.columns(3)
                 for i, (_, row) in enumerate(cap_df.nlargest(3, 'Score').iterrows()):
@@ -860,7 +875,22 @@ with tabs[0]:
                         color = "green" if d <= 2 else "orange" if d <= 3 else "red"
                         st.markdown(f"Difficulty: :{color}[Level {d}]")
                         st.metric("Cap Score", row['Score'])
-                        st.caption(f"Tier: {row['Tier']}  |  Projected (2GW): {row['proj_pts']}  |  Confidence: {row['Confidence']}%")
+                        st.caption(
+                            f"Tier: {row['Tier']}  |  Projected (2GW): {row['proj_pts']}  |  "
+                            f"Confidence: {row['confidence_tier']} ({row['Confidence']}%)"
+                        )
+                        if row.get("confidence_flags", "—") != "—":
+                            st.caption(f"Flags: {row['confidence_flags']}")
+
+                        # Reason codes for the top pick (keeps UI compact)
+                        if i == 0:
+                            with st.expander("Why this captain? (reason breakdown)", expanded=False):
+                                rb = captain_reason_breakdown(
+                                    row,
+                                    max_ict=_max_ict,
+                                    home_captain_bonus=float(HOME_CAPTAIN_BONUS),
+                                )
+                                st.dataframe(rb, use_container_width=True, hide_index=True)
 
                 st.markdown("---")
                 st.subheader("Captaincy Matrix")
@@ -869,18 +899,144 @@ with tabs[0]:
                 _matrix["Captain Rank Score"] = (
                     _matrix["Score"] * 0.6 + _matrix["proj_pts"] * 0.4
                 ).round(2)
-                mcols = ["web_name", "team_name", "pos", "Opp", "Loc", "Diff", "Score", "proj_pts", "Confidence", "Captain Rank Score"]
+                mcols = [
+                    "web_name",
+                    "team_name",
+                    "pos",
+                    "Opp",
+                    "Loc",
+                    "Diff",
+                    "Score",
+                    "proj_pts",
+                    "Confidence",
+                    "confidence_tier",
+                    "confidence_flags",
+                    "Captain Rank Score",
+                ]
                 st.dataframe(
                     get_display_df(_matrix.sort_values("Captain Rank Score", ascending=False), mcols).head(15),
                     use_container_width=True,
                     hide_index=True,
                 )
+
+                # "Why not" near-misses (adds context beyond the top pick)
+                st.markdown("---")
+                st.subheader("Why not the next-best picks?")
+                st.caption("Near-miss notes comparing each candidate to the #1 captain.")
+                ranked = _matrix.sort_values("Captain Rank Score", ascending=False).reset_index(drop=True)
+                if len(ranked) >= 4:
+                    winner = ranked.iloc[0]
+                    for j in range(1, min(5, len(ranked))):
+                        cand = ranked.iloc[j]
+                        notes = why_not_notes(candidate=cand, winner=winner)
+                        if not notes:
+                            notes = ["Very close — mostly preference / variance."]
+                        st.markdown(
+                            f"**#{j+1}: {cand['web_name']}** — " + "; ".join(notes)
+                        )
+
                 st.download_button(
                     "Download captaincy matrix CSV",
                     df_to_csv(get_display_df(_matrix.sort_values("Captain Rank Score", ascending=False), mcols)),
                     file_name="captaincy_matrix.csv",
                     mime="text/csv",
                 )
+
+                # --- Weekly One‑Click Plan Brief ---
+                st.markdown("---")
+                st.header("Weekly One‑Click Plan")
+                st.caption("A single digest: captain, VC, XI, bench order, quick transfer idea, chip note, key risks.")
+
+                captain = ranked.iloc[0] if len(ranked) > 0 else None
+                vice = ranked.iloc[1] if len(ranked) > 1 else None
+
+                # Quick transfer idea (lightweight): identify your lowest projected player.
+                _low = squad_proj.sort_values("proj_pts", ascending=True).head(1)
+                transfer_idea = None
+                if not _low.empty:
+                    transfer_idea = f"Consider upgrading **{_low.iloc[0]['web_name']}** (low projected points)."
+
+                # Chip note (reuse same heuristics as sidebar, computed locally here).
+                chip_note = None
+                if next_gw:
+                    gw_fixtures = [f for f in fixtures_raw if f.get("event") == next_gw["id"]]
+                    if gw_fixtures:
+                        all_teams_playing = [f["team_h"] for f in gw_fixtures] + [f["team_a"] for f in gw_fixtures]
+                        team_counts = pd.Series(all_teams_playing).value_counts()
+                        dgw_teams = team_counts[team_counts > 1].index.tolist()
+                        active_teams = set(team_counts.index)
+                        blank_players = my_squad[~my_squad["team"].isin(active_teams)]
+                        my_dgw_players = my_squad[my_squad["team"].isin(dgw_teams)]
+                        if len(blank_players) >= BLANK_FREE_HIT_THRESHOLD:
+                            chip_note = f"Free Hit candidate: **{len(blank_players)}** blanking players."
+                        elif len(my_dgw_players) >= DGW_BENCH_BOOST_THRESHOLD:
+                            chip_note = f"Bench Boost candidate: **{len(my_dgw_players)}** DGW players in squad."
+                        elif len(dgw_teams) > 0:
+                            chip_note = "Double Gameweek upcoming — consider targeting DGW minutes certainty."
+
+                # Risks: low confidence starters + flagged news
+                risks: list[str] = []
+                _low_conf_starters = xi_df[xi_df["play_prob"] < 0.6]["web_name"].tolist() if "play_prob" in xi_df.columns else []
+                if _low_conf_starters:
+                    risks.append("Low minutes confidence in XI: " + ", ".join(_low_conf_starters))
+                if "chance_of_playing_next_round" in my_squad.columns:
+                    _chance = pd.to_numeric(my_squad["chance_of_playing_next_round"], errors="coerce").fillna(100)
+                else:
+                    _chance = pd.Series([100] * len(my_squad), index=my_squad.index)
+                if "news" in my_squad.columns:
+                    _news = my_squad["news"].astype(str).fillna("")
+                else:
+                    _news = pd.Series([""] * len(my_squad), index=my_squad.index)
+                _flagged = my_squad[(_chance < 75) & (_news.str.len() > 0)]
+                if not _flagged.empty:
+                    risks.append("Injury/rotation flags present (see sidebar warnings).")
+
+                plan_md = build_one_click_plan_markdown(
+                    gw_id=next_gw["id"] if next_gw else None,
+                    captain=captain,
+                    vice=vice,
+                    xi_df=xi_df,
+                    bench_df=bench_ordered,
+                    chip_note=chip_note,
+                    transfer_idea=transfer_idea,
+                    risks=risks,
+                )
+                st.markdown(plan_md)
+                st.download_button(
+                    "Download plan (Markdown)",
+                    data=plan_md,
+                    file_name=f"weekly_plan_gw{next_gw['id'] if next_gw else 'na'}.md",
+                    mime="text/markdown",
+                    help="Exports the weekly plan as a Markdown file.",
+                )
+
+                # --- EO / Template Risk Panel ---
+                st.markdown("---")
+                st.header("EO / Template Risk")
+                st.caption("Ownership-based risk proxy: how well you're shielded vs the template, and where your upside lives.")
+
+                players_proj = add_projection_columns(players.copy(), horizon_gws=2)
+                eo = eo_risk_panel(
+                    players=players_proj,
+                    my_squad_ids=set([int(x) for x in my_player_ids]),
+                    captain_id=int(captain["id"]) if captain is not None else None,
+                    template_top_n=30,
+                    differential_own_cutoff=float(DIFF_MAX_OWNERSHIP),
+                )
+
+                e1, e2 = st.columns(2)
+                e1.metric("Shield score", eo["shield_score"], help="Coverage vs top-owned template players (captain adds extra). Higher = safer.")
+                e2.metric("Attack score", eo["attack_score"], help="Upside from low-owned players with projection. Higher = more aggressive.")
+
+                t1, t2 = st.columns(2)
+                with t1:
+                    st.subheader("Top threats (template players you don't own)")
+                    threats_cols = ["web_name", "team_name", "pos", "selected_by_percent", "proj_pts", "threat_score"]
+                    st.dataframe(get_display_df(eo["threats_df"], threats_cols), use_container_width=True, hide_index=True)
+                with t2:
+                    st.subheader("Your differentials (low-owned upside)")
+                    diff_cols = ["web_name", "team_name", "pos", "selected_by_percent", "proj_pts", "play_prob"]
+                    st.dataframe(get_display_df(eo["differentials_df"], diff_cols), use_container_width=True, hide_index=True)
             except (KeyError, ValueError):
                 st.info("Fixture data pending.")
         else:
