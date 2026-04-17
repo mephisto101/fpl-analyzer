@@ -4,6 +4,13 @@ import requests
 import plotly.graph_objects as go
 import json
 from pathlib import Path
+from fpl.logic import (
+    add_estimated_effective_ownership,
+    build_captaincy_matrix,
+    build_weekly_plan_markdown,
+    compute_shield_attack_scores,
+    optimize_starting_xi,
+)
 
 # ==========================================
 # 1. PAGE CONFIGURATION & CSS
@@ -167,6 +174,13 @@ COLUMN_LABELS = {
     "proj_pts": "Projected Points",
     "set_pieces": "Set Pieces",
     "pens": "Penalties",
+    "Confidence": "Confidence %",
+    "Confidence Tier": "Confidence Tier",
+    "Captain Rank Score": "Captain Rank",
+    "Reason Codes": "Reason Codes",
+    "Why Not": "Why-not Note",
+    "est_eo": "Est EO %",
+    "attack_index": "Attack Index",
 }
 
 LOCAL_SETTINGS_PATH = ".local_settings.json"
@@ -522,6 +536,10 @@ def fetch_squad_picks(manager_id, gw_id):
 def df_to_csv(df):
     return df.to_csv(index=False).encode('utf-8')
 
+
+def text_to_bytes(text: str) -> bytes:
+    return str(text).encode("utf-8")
+
 def get_chip_status(used_chips):
     """
     Return dict of chip label -> status string.
@@ -780,8 +798,7 @@ with tabs[0]:
         squad_proj = add_projection_columns(my_squad, horizon_gws=int(_horizon))
 
         try:
-            from fpl.logic import optimize_starting_xi as _opt_xi  # type: ignore
-            xi_df, bench_df = _opt_xi(squad_proj, score_col="proj_pts", pos_col="pos")
+            xi_df, bench_df = optimize_starting_xi(squad_proj, score_col="proj_pts", pos_col="pos")
         except Exception:
             xi_df = squad_proj.sort_values("proj_pts", ascending=False).head(11).copy()
             bench_df = squad_proj.drop(index=xi_df.index).sort_values("proj_pts", ascending=False).copy()
@@ -830,29 +847,19 @@ with tabs[0]:
                     opp_map[f['team_h']] = {'opp': team_map[f['team_a']], 'diff': f['team_h_difficulty'], 'loc': 'H'}
                     opp_map[f['team_a']] = {'opp': team_map[f['team_h']], 'diff': f['team_a_difficulty'], 'loc': 'A'}
 
-                cap_df = my_squad.copy()
-                cap_df['Opp'] = cap_df['team'].apply(lambda x: opp_map.get(x, {}).get('opp', 'N/A'))
-                cap_df['Diff'] = cap_df['team'].apply(lambda x: opp_map.get(x, {}).get('diff', 3))
-                cap_df['Loc'] = cap_df['team'].apply(lambda x: opp_map.get(x, {}).get('loc', 'A'))
-                # Enhanced formula: Form 45% + ICT (normalised) 30% + Fixture 20% + Home 5%
-                _max_ict = float(players['ict_index'].max()) or 1.0
-                cap_df['ict_norm'] = (cap_df['ict_index'].astype(float) / _max_ict * 10).round(1)
-                cap_df['Score'] = (
-                    cap_df['form'] * 0.45 +
-                    cap_df['ict_norm'] * 0.30 +
-                    (6 - cap_df['Diff']) * 0.20 +
-                    cap_df['Loc'].apply(lambda loc: HOME_CAPTAIN_BONUS if loc == 'H' else 0)
-                ).round(2)
-                cap_df['Tier'] = cap_df['Score'].apply(
-                    lambda s: 'A — Strong' if s > 4 else ('B — Solid' if s >= 2.5 else 'C — Risky')
+                cap_seed = my_squad.copy()
+                cap_seed['Opp'] = cap_seed['team'].apply(lambda x: opp_map.get(x, {}).get('opp', 'N/A'))
+                cap_seed['Diff'] = cap_seed['team'].apply(lambda x: opp_map.get(x, {}).get('diff', 3))
+                cap_seed['Loc'] = cap_seed['team'].apply(lambda x: opp_map.get(x, {}).get('loc', 'A'))
+                cap_seed = add_projection_columns(cap_seed, horizon_gws=2)
+                cap_df = build_captaincy_matrix(
+                    cap_seed,
+                    max_ict=float(players['ict_index'].max()) or 1.0,
+                    home_bonus=HOME_CAPTAIN_BONUS,
                 )
 
-                # Add projections + a confidence proxy
-                cap_df = add_projection_columns(cap_df, horizon_gws=2)
-                cap_df["Confidence"] = (cap_df["play_prob"] * 100).round(0).astype(int)
-
                 c_cols = st.columns(3)
-                for i, (_, row) in enumerate(cap_df.nlargest(3, 'Score').iterrows()):
+                for i, (_, row) in enumerate(cap_df.head(3).iterrows()):
                     with c_cols[i]:
                         st.subheader(f"#{i+1}: {row['web_name']}")
                         st.write(f"vs **{row['Opp']}** ({row['Loc']})")
@@ -860,26 +867,158 @@ with tabs[0]:
                         color = "green" if d <= 2 else "orange" if d <= 3 else "red"
                         st.markdown(f"Difficulty: :{color}[Level {d}]")
                         st.metric("Cap Score", row['Score'])
-                        st.caption(f"Tier: {row['Tier']}  |  Projected (2GW): {row['proj_pts']}  |  Confidence: {row['Confidence']}%")
+                        st.caption(
+                            f"Tier: {row['Tier']} ({row['Confidence Tier']})"
+                            f"  |  Projected (2GW): {row['proj_pts']}"
+                            f"  |  Confidence: {row['Confidence']}%"
+                        )
+                        st.caption(f"Reasons: {row['Reason Codes']}")
 
                 st.markdown("---")
                 st.subheader("Captaincy Matrix")
-                st.caption("Ranked table using Cap Score + projected points + minutes confidence.")
+                st.caption("Ranked table using cap score, projections, and minutes confidence with transparent reason codes.")
                 _matrix = cap_df.copy()
-                _matrix["Captain Rank Score"] = (
-                    _matrix["Score"] * 0.6 + _matrix["proj_pts"] * 0.4
-                ).round(2)
-                mcols = ["web_name", "team_name", "pos", "Opp", "Loc", "Diff", "Score", "proj_pts", "Confidence", "Captain Rank Score"]
+                mcols = [
+                    "web_name", "team_name", "pos", "Opp", "Loc", "Diff",
+                    "Score", "proj_pts", "Confidence", "Confidence Tier",
+                    "Reason Codes", "Why Not", "Captain Rank Score",
+                ]
                 st.dataframe(
-                    get_display_df(_matrix.sort_values("Captain Rank Score", ascending=False), mcols).head(15),
+                    get_display_df(_matrix, mcols).head(15),
                     use_container_width=True,
                     hide_index=True,
                 )
                 st.download_button(
                     "Download captaincy matrix CSV",
-                    df_to_csv(get_display_df(_matrix.sort_values("Captain Rank Score", ascending=False), mcols)),
+                    df_to_csv(get_display_df(_matrix, mcols)),
                     file_name="captaincy_matrix.csv",
                     mime="text/csv",
+                )
+
+                # --- EO Risk Panel ---
+                st.markdown("---")
+                st.subheader("EO Risk Panel (Shield vs Attack)")
+                st.caption("Estimated effective ownership view to balance rank protection (shield) and upside chasing (attack).")
+                eo_horizon = st.slider(
+                    "EO horizon (GWs)",
+                    min_value=1,
+                    max_value=5,
+                    value=2,
+                    key="eo_horizon",
+                    help="How many upcoming gameweeks to blend into projected points for attack score.",
+                )
+                eo_pool = add_projection_columns(players.copy(), horizon_gws=int(eo_horizon))
+                cap_ids = {int(cap_df.iloc[0]["id"])} if not cap_df.empty and "id" in cap_df.columns else set()
+                eo_pool = add_estimated_effective_ownership(eo_pool, captain_ids=cap_ids)
+                eo_scores = compute_shield_attack_scores(
+                    eo_pool,
+                    squad_player_ids={int(x) for x in my_player_ids},
+                    top_n=15,
+                    differential_eo_cap=float(DIFF_MAX_OWNERSHIP),
+                )
+
+                eo1, eo2, eo3 = st.columns(3)
+                eo1.metric("Shield score", f"{eo_scores['shield_score']}%")
+                eo2.metric("Attack score", f"{eo_scores['attack_score']}%")
+                eo3.metric("Core EO covered", f"{eo_scores['core_owned_count']}/{eo_scores['core_total_count']}")
+
+                risk_mode = "Balanced"
+                if eo_scores["shield_score"] < 55:
+                    risk_mode = "High rank volatility"
+                elif eo_scores["attack_score"] > 55:
+                    risk_mode = "Aggressive upside"
+                st.caption(f"Current profile: **{risk_mode}**")
+
+                danger_cols = ["web_name", "team_name", "pos", "est_eo", "proj_pts", "selected_by_percent"]
+                attack_cols = ["web_name", "team_name", "pos", "attack_index", "est_eo", "proj_pts", "selected_by_percent"]
+                ddf = eo_scores["core_dangers"].head(8)
+                adf = eo_scores["attack_assets"].head(8)
+                dr1, dr2 = st.columns(2)
+                with dr1:
+                    st.markdown("**EO Danger (high-EO assets you don't own)**")
+                    if ddf.empty:
+                        st.success("No major EO threats in the tracked core.")
+                    else:
+                        st.dataframe(get_display_df(ddf, danger_cols), use_container_width=True, hide_index=True)
+                with dr2:
+                    st.markdown("**Attack Assets (your low-EO upside picks)**")
+                    if adf.empty:
+                        st.info("No low-EO upside assets in your current squad.")
+                    else:
+                        st.dataframe(get_display_df(adf, attack_cols), use_container_width=True, hide_index=True)
+
+                # --- Weekly Plan Brief ---
+                st.markdown("---")
+                st.subheader("One-Click Weekly Plan")
+                st.caption("Auto-generated summary for your next deadline: captaincy, XI, bench, transfer idea, and risks.")
+
+                top_captain = cap_df.iloc[0].to_dict() if len(cap_df) >= 1 else None
+                vice_captain = cap_df.iloc[1].to_dict() if len(cap_df) >= 2 else None
+
+                transfer_note = "Roll transfer."
+                try:
+                    _eff = my_squad.copy()
+                    _eff["efficiency"] = (_eff["form"] + (_eff["total_points"] / _eff["price"].clip(lower=0.1))).round(1)
+                    _sell = _eff.sort_values("efficiency").iloc[0]
+                    _budget = float(_sell["price"]) + float(TRANSFER_BUDGET_BUFFER)
+                    _buy_pool = players[
+                        (players["pos"] == _sell["pos"]) &
+                        (~players["id"].isin(my_player_ids)) &
+                        (players["price"] <= _budget)
+                    ].copy()
+                    _buy_pool = add_projection_columns(_buy_pool, horizon_gws=3).sort_values("proj_pts", ascending=False)
+                    if not _buy_pool.empty:
+                        _buy = _buy_pool.iloc[0]
+                        transfer_note = (
+                            f"Consider {str(_sell['web_name'])} -> {str(_buy['web_name'])} "
+                            f"(est +{round(float(_buy['proj_pts']) - float(_sell.get('proj_pts', 0)), 1)} proj pts / 3 GW)."
+                        )
+                except Exception:
+                    transfer_note = "Review transfer candidates in the Transfers tab."
+
+                chip_note = "Save chips."
+                _gw_status = gw_status_for(next_gw["id"]) if next_gw else {"dgw_team_ids": [], "active_team_ids": set()}
+                _dgw_teams = _gw_status.get("dgw_team_ids", [])
+                _active = _gw_status.get("active_team_ids", set())
+                _blank_players = my_squad[~my_squad["team"].isin(_active)] if _active else pd.DataFrame()
+                _my_dgw = my_squad[my_squad["team"].isin(_dgw_teams)] if _dgw_teams else pd.DataFrame()
+                if len(_blank_players) >= BLANK_FREE_HIT_THRESHOLD:
+                    chip_note = f"Free Hit strongly considered ({len(_blank_players)} blanks)."
+                elif len(_my_dgw) >= DGW_BENCH_BOOST_THRESHOLD:
+                    chip_note = f"Bench Boost candidate ({len(_my_dgw)} DGW players)."
+                elif not _my_dgw.empty and float(_my_dgw["form"].max()) >= FORM_TC_THRESHOLD:
+                    chip_note = f"Triple Captain watch on {_my_dgw.sort_values('form', ascending=False).iloc[0]['web_name']}."
+
+                risk_notes = []
+                if "chance_of_playing_next_round" in my_squad.columns:
+                    _mins_risk = my_squad[my_squad["chance_of_playing_next_round"] < 75]["web_name"].tolist()
+                    if _mins_risk:
+                        risk_notes.append(f"Availability flags: {', '.join(_mins_risk[:4])}")
+                _rot = my_squad[my_squad["rotation_risk"] == "Low mins"]["web_name"].tolist()
+                if _rot:
+                    risk_notes.append(f"Low-minute rotation risk: {', '.join(_rot[:4])}")
+                if not ddf.empty:
+                    risk_notes.append(
+                        "EO danger exposures: " + ", ".join(ddf["web_name"].astype(str).head(3).tolist())
+                    )
+                risk_notes = risk_notes[:3]
+
+                weekly_md = build_weekly_plan_markdown(
+                    gw_id=int(next_gw["id"]) if next_gw else None,
+                    captain=top_captain,
+                    vice_captain=vice_captain,
+                    xi_names=xi_df["web_name"].astype(str).tolist(),
+                    bench_names=bench_ordered["web_name"].astype(str).tolist(),
+                    transfer_note=transfer_note,
+                    chip_note=chip_note,
+                    risk_notes=risk_notes,
+                )
+                st.markdown(weekly_md)
+                st.download_button(
+                    "Download weekly plan (Markdown)",
+                    weekly_md.encode("utf-8"),
+                    file_name=f"gw{int(next_gw['id']) if next_gw else 'next'}_weekly_plan.md",
+                    mime="text/markdown",
                 )
             except (KeyError, ValueError):
                 st.info("Fixture data pending.")
