@@ -1,0 +1,6 @@
+FPL_API_BASE_URL = "https://fantasy.premierleague.com/api/"
+REQUEST_TIMEOUT_S = 10
+FPL_DATA_CACHE_TTL_S = 3600
+
+DEFAULT_MANAGER_ID = "587574"
+
