@@ -829,7 +829,8 @@ if my_id and curr_gw_event:
 # ==========================================
 tabs = st.tabs([
     "My Team", "Live GW", "GW History", "Global Scout", "Price Changes",
-    "Ticker", "Player VS", "Mini-League", "Rivals", "Transfers", "Wildcard"
+    "Ticker", "Player VS", "Mini-League", "Rivals", "Transfers", "Wildcard",
+    "Lineup", "Captaincy", "Weekly Plan", "Risk / EO", "Chips"
 ])
 
 # ── TAB 0: MY TEAM ──────────────────────────────────────────────────────────
@@ -3038,3 +3039,203 @@ with tabs[10]:
         ),
         use_container_width=True, hide_index=True,
     )
+
+# ── EXTRA TEAM TABS (to declutter "My Team") ────────────────────────────────
+
+with tabs[11]:
+    st.header("Lineup")
+    if my_squad.empty:
+        st.info("Enter your Manager ID in the sidebar to view lineup tools.")
+    else:
+        st.caption("Projection-based XI optimizer and bench order.")
+        _horizon = st.slider("Projection horizon (GWs)", 2, 5, 3, key="lineup_horizon")
+        squad_proj = add_projection_columns(my_squad, horizon_gws=int(_horizon))
+        try:
+            from fpl.logic import optimize_starting_xi as _opt_xi  # type: ignore
+            xi_df, bench_df = _opt_xi(squad_proj, score_col="proj_pts", pos_col="pos")
+        except Exception:
+            xi_df = squad_proj.sort_values("proj_pts", ascending=False).head(11).copy()
+            bench_df = squad_proj.drop(index=xi_df.index).sort_values("proj_pts", ascending=False).copy()
+
+        xi_cols = [
+            "web_name",
+            "team_name",
+            "pos",
+            "price",
+            "proj_pts",
+            "play_prob",
+            "confidence_tier",
+            "variance_flags",
+            "xpts",
+            "form",
+            "expected_goals",
+            "expected_assists",
+            "expected_goal_involvements",
+            "expected_goals_conceded",
+            "rotation_risk",
+            "selected_by_percent",
+        ]
+        st.subheader("Suggested Starting XI")
+        st.dataframe(get_display_df(xi_df, xi_cols), width="stretch", hide_index=True)
+
+        st.subheader("Suggested Bench Order")
+        b = bench_df.copy()
+        b_gk = b[b["pos"] == "GKP"].sort_values("proj_pts", ascending=False)
+        b_out = b[b["pos"] != "GKP"].sort_values("proj_pts", ascending=False)
+        bench_ordered = pd.concat([b_out, b_gk], ignore_index=True)
+        st.dataframe(get_display_df(bench_ordered, xi_cols), width="stretch", hide_index=True)
+
+        st.download_button(
+            "Download XI plan CSV",
+            df_to_csv(get_display_df(pd.concat([xi_df.assign(role="Starting XI"), bench_ordered.assign(role="Bench")]), ["role"] + xi_cols)),
+            file_name="xi_bench_plan.csv",
+            mime="text/csv",
+        )
+
+with tabs[12]:
+    st.header("Captaincy")
+    if my_squad.empty:
+        st.info("Enter your Manager ID in the sidebar to view captaincy tools.")
+    elif not next_gw:
+        st.info("Fixture data pending.")
+    else:
+        try:
+            opp_map = {}
+            for f in [f for f in fixtures_raw if f['event'] == next_gw['id']]:
+                opp_map[f['team_h']] = {'opp': team_map[f['team_a']], 'diff': f['team_h_difficulty'], 'loc': 'H'}
+                opp_map[f['team_a']] = {'opp': team_map[f['team_h']], 'diff': f['team_a_difficulty'], 'loc': 'A'}
+
+            cap_df = my_squad.copy()
+            cap_df['Opp'] = cap_df['team'].apply(lambda x: opp_map.get(x, {}).get('opp', 'N/A'))
+            cap_df['Diff'] = cap_df['team'].apply(lambda x: opp_map.get(x, {}).get('diff', 3))
+            cap_df['Loc'] = cap_df['team'].apply(lambda x: opp_map.get(x, {}).get('loc', 'A'))
+            _max_ict = float(players['ict_index'].max()) or 1.0
+            cap_df['ict_norm'] = (cap_df['ict_index'].astype(float) / _max_ict * 10).round(1)
+            cap_df['Score'] = (
+                cap_df['form'] * 0.45 +
+                cap_df['ict_norm'] * 0.30 +
+                (6 - cap_df['Diff']) * 0.20 +
+                cap_df['Loc'].apply(lambda loc: HOME_CAPTAIN_BONUS if loc == 'H' else 0)
+            ).round(2)
+            cap_df['Tier'] = cap_df['Score'].apply(
+                lambda s: 'A — Strong' if s > 4 else ('B — Solid' if s >= 2.5 else 'C — Risky')
+            )
+
+            cap_df = add_projection_columns(cap_df, horizon_gws=2)
+            cap_df["Confidence"] = (cap_df["play_prob"] * 100).round(0).astype(int)
+            _conf = cap_df.apply(lambda r: captain_confidence(r), axis=1, result_type="expand")
+            cap_df["confidence_tier"] = _conf[0]
+            cap_df["confidence_flags"] = _conf[1].apply(lambda xs: ", ".join(xs) if xs else "—")
+
+            st.subheader("Top picks")
+            c_cols = st.columns(3)
+            for i, (_, row) in enumerate(cap_df.nlargest(3, 'Score').iterrows()):
+                with c_cols[i]:
+                    st.subheader(f"#{i+1}: {row['web_name']}")
+                    st.write(f"vs **{row['Opp']}** ({row['Loc']})")
+                    st.metric("Cap Score", row['Score'])
+                    st.caption(f"Tier: {row['Tier']} | Proj: {row['proj_pts']} | Conf: {row['confidence_tier']} ({row['Confidence']}%)")
+                    if i == 0:
+                        with st.expander("Why this captain? (reason breakdown)", expanded=False):
+                            rb = captain_reason_breakdown(
+                                row,
+                                max_ict=_max_ict,
+                                home_captain_bonus=float(HOME_CAPTAIN_BONUS),
+                            )
+                            st.dataframe(rb, width="stretch", hide_index=True)
+
+            st.markdown("---")
+            _matrix = cap_df.copy()
+            _matrix["Captain Rank Score"] = (_matrix["Score"] * 0.6 + _matrix["proj_pts"] * 0.4).round(2)
+            mcols = [
+                "web_name",
+                "team_name",
+                "pos",
+                "Opp",
+                "Loc",
+                "Diff",
+                "Score",
+                "proj_pts",
+                "Confidence",
+                "confidence_tier",
+                "confidence_flags",
+                "variance_flags",
+                "Captain Rank Score",
+            ]
+            st.subheader("Captaincy Matrix")
+            st.dataframe(get_display_df(_matrix.sort_values("Captain Rank Score", ascending=False), mcols).head(15), width="stretch", hide_index=True)
+        except (KeyError, ValueError):
+            st.info("Fixture data pending.")
+
+with tabs[13]:
+    st.header("Weekly Plan")
+    if my_squad.empty:
+        st.info("Enter your Manager ID in the sidebar to build a weekly plan.")
+    else:
+        _h = int(st.session_state.get("xi_horizon", 3))
+        squad_proj = add_projection_columns(my_squad, horizon_gws=_h)
+        cap_pick = squad_proj.sort_values(["proj_pts", "play_prob"], ascending=[False, False]).head(2)
+        captain = cap_pick.iloc[0] if len(cap_pick) > 0 else None
+        vice = cap_pick.iloc[1] if len(cap_pick) > 1 else None
+
+        starters = my_squad[my_squad["position"].astype(int) <= 11].sort_values("position")
+        bench = my_squad[my_squad["position"].astype(int) > 11].sort_values("position")
+        plan_md = build_one_click_plan_markdown(
+            gw_id=next_gw["id"] if next_gw else None,
+            captain=captain,
+            vice=vice,
+            xi_df=starters,
+            bench_df=bench,
+            chip_note=None,
+            transfer_idea=None,
+            risks=[],
+        )
+        st.markdown(plan_md)
+        st.download_button(
+            "Download plan (Markdown)",
+            data=plan_md,
+            file_name=f"weekly_plan_gw{next_gw['id'] if next_gw else 'na'}.md",
+            mime="text/markdown",
+        )
+
+with tabs[14]:
+    st.header("Risk / EO")
+    if my_squad.empty:
+        st.info("Enter your Manager ID in the sidebar to view EO tools.")
+    else:
+        players_proj = add_projection_columns(players.copy(), horizon_gws=2)
+        _top_owned = players_proj.sort_values("selected_by_percent", ascending=False).head(12).copy()
+        _templ_opts = _top_owned["web_name"].tolist()
+        _template_cap_name = st.selectbox("Assumed template captain", options=_templ_opts, index=0, key="template_captain_assumption_tab")
+        _template_cap_row = _top_owned[_top_owned["web_name"] == _template_cap_name].head(1)
+        _template_cap_id = int(_template_cap_row.iloc[0]["id"]) if not _template_cap_row.empty else None
+        eo = eo_risk_panel(
+            players=players_proj,
+            my_squad_ids=set([int(x) for x in my_player_ids]),
+            captain_id=_template_cap_id,
+            template_top_n=30,
+            differential_own_cutoff=float(DIFF_MAX_OWNERSHIP),
+        )
+        e1, e2 = st.columns(2)
+        e1.metric("Shield score", eo["shield_score"])
+        e2.metric("Attack score", eo["attack_score"])
+        threats_cols = ["web_name", "team_name", "pos", "selected_by_percent", "proj_pts", "confidence_tier", "variance_flags", "threat_score"]
+        st.subheader("Top threats")
+        st.dataframe(get_display_df(eo["threats_df"], threats_cols), width="stretch", hide_index=True)
+
+with tabs[15]:
+    st.header("Chips")
+    if not my_id:
+        st.info("Enter your Manager ID in the sidebar to see chip usage.")
+    else:
+        try:
+            history = get_manager_history(my_id)
+            used_chips = history.get('chips', [])
+            chip_status = get_chip_status(used_chips)
+            chip_cols = st.columns(len(chip_status))
+            for col, (chip_label, status) in zip(chip_cols, chip_status.items()):
+                col.metric(chip_label, status)
+            with st.expander("Chip history (debug)", expanded=False):
+                st.json(used_chips[:20])
+        except requests.RequestException:
+            st.warning("Could not load chip data.")
