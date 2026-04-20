@@ -919,11 +919,45 @@ with tabs[0]:
                     hide_index=True,
                 )
 
+                # On-demand reason breakdown (keeps the matrix clean)
+                st.markdown("---")
+                st.subheader("On-demand: captain reasoning")
+                st.caption("Pick any candidate to see the weighted reason breakdown + confidence flags.")
+
+                ranked = _matrix.sort_values("Captain Rank Score", ascending=False).reset_index(drop=True)
+                _pick_names = ranked.head(15)["web_name"].tolist()
+                _default_name = str(_pick_names[0]) if _pick_names else ""
+                _picked_name = st.selectbox(
+                    "Show reasoning for",
+                    options=_pick_names,
+                    index=0,
+                    help="Select a player to see the reason breakdown and confidence details.",
+                    key="capt_reason_pick",
+                )
+                _picked = ranked[ranked["web_name"] == _picked_name].head(1)
+                if not _picked.empty:
+                    _row = _picked.iloc[0]
+                    r1, r2 = st.columns([1.2, 1])
+                    with r1:
+                        st.markdown(f"**Weighted reason breakdown — {_picked_name}**")
+                        rb = captain_reason_breakdown(
+                            _row,
+                            max_ict=_max_ict,
+                            home_captain_bonus=float(HOME_CAPTAIN_BONUS),
+                        )
+                        st.dataframe(rb, use_container_width=True, hide_index=True)
+                    with r2:
+                        st.markdown("**Confidence + context**")
+                        st.metric("Confidence tier", _row.get("confidence_tier", "—"))
+                        st.metric("Minutes confidence", f"{int(_row.get('Confidence', 0))}%")
+                        st.caption(f"Flags: {_row.get('confidence_flags', '—')}")
+                        st.caption(f"Opponent: {_row.get('Opp', '—')} ({_row.get('Loc', '—')}), difficulty {int(_row.get('Diff', 3))}")
+                        st.caption(f"Captain Rank Score: {_row.get('Captain Rank Score', '—')} (Score×0.6 + proj×0.4)")
+
                 # "Why not" near-misses (adds context beyond the top pick)
                 st.markdown("---")
                 st.subheader("Why not the next-best picks?")
                 st.caption("Near-miss notes comparing each candidate to the #1 captain.")
-                ranked = _matrix.sort_values("Captain Rank Score", ascending=False).reset_index(drop=True)
                 if len(ranked) >= 4:
                     winner = ranked.iloc[0]
                     for j in range(1, min(5, len(ranked))):
@@ -1010,12 +1044,64 @@ with tabs[0]:
                     help="Exports the weekly plan as a Markdown file.",
                 )
 
+                # --- Chip Simulators (lightweight heuristics) ---
+                with st.expander("Chip simulators (estimates)", expanded=False):
+                    st.caption("Heuristic estimates based on projected points. Use as guidance, not a guarantee.")
+                    if captain is not None:
+                        # Triple Captain: extra over normal captaincy is +1× captain projected points.
+                        tc_extra = float(pd.to_numeric(captain.get("proj_pts", 0), errors="coerce") or 0.0)
+                        st.metric(
+                            "Triple Captain — estimated extra points",
+                            round(tc_extra, 1),
+                            help="Approx extra vs normal captain: +1× captain projected points for the horizon.",
+                        )
+                    # Bench Boost: approximate extra points from bench players.
+                    if "proj_pts" in bench_ordered.columns:
+                        bb_extra = float(pd.to_numeric(bench_ordered["proj_pts"], errors="coerce").fillna(0.0).sum())
+                        st.metric(
+                            "Bench Boost — estimated bench points",
+                            round(bb_extra, 1),
+                            help="Approx points from bench if all play, using the same projection horizon as the XI optimizer.",
+                        )
+                    # Free Hit: highlight if you have many blanks next GW.
+                    if next_gw:
+                        gw_fixtures = [f for f in fixtures_raw if f.get("event") == next_gw["id"]]
+                        if gw_fixtures:
+                            all_teams_playing = [f["team_h"] for f in gw_fixtures] + [f["team_a"] for f in gw_fixtures]
+                            active_teams = set(pd.Series(all_teams_playing).value_counts().index.tolist())
+                            blanks = my_squad[~my_squad["team"].isin(active_teams)]
+                            st.metric(
+                                "Free Hit — blanking players",
+                                int(len(blanks)),
+                                help="Counts your squad players whose team has no fixture in the next GW.",
+                            )
+                            if len(blanks) > 0:
+                                st.caption("Blanking: " + ", ".join(blanks["web_name"].tolist()))
+
                 # --- EO / Template Risk Panel ---
                 st.markdown("---")
                 st.header("EO / Template Risk")
                 st.caption("Ownership-based risk proxy: how well you're shielded vs the template, and where your upside lives.")
 
                 players_proj = add_projection_columns(players.copy(), horizon_gws=2)
+                # Captaincy scenario explorer: pick an assumed template captain.
+                _top_owned = players_proj.sort_values("selected_by_percent", ascending=False).head(12).copy()
+                _templ_opts = _top_owned["web_name"].tolist()
+                _templ_default = _templ_opts[0] if _templ_opts else None
+                _template_cap_name = st.selectbox(
+                    "Assumed template captain",
+                    options=_templ_opts,
+                    index=0,
+                    help="Used to estimate rank-protection risk. Default is the most-owned player.",
+                    key="template_captain_assumption",
+                )
+                _template_cap_row = _top_owned[_top_owned["web_name"] == _template_cap_name].head(1)
+                _template_cap_id = int(_template_cap_row.iloc[0]["id"]) if not _template_cap_row.empty else None
+                _template_cap_owned = (_template_cap_id in set([int(x) for x in my_player_ids])) if _template_cap_id else False
+
+                if _template_cap_id and not _template_cap_owned:
+                    st.warning(f"Template captain risk: you do **not** own **{_template_cap_name}**.")
+
                 eo = eo_risk_panel(
                     players=players_proj,
                     my_squad_ids=set([int(x) for x in my_player_ids]),
@@ -1027,6 +1113,17 @@ with tabs[0]:
                 e1, e2 = st.columns(2)
                 e1.metric("Shield score", eo["shield_score"], help="Coverage vs top-owned template players (captain adds extra). Higher = safer.")
                 e2.metric("Attack score", eo["attack_score"], help="Upside from low-owned players with projection. Higher = more aggressive.")
+
+                # Simple captaincy swing proxy
+                if _template_cap_id and captain is not None:
+                    _my_cap_name = str(captain.get("web_name", "—"))
+                    if _template_cap_name != _my_cap_name:
+                        _templ_own = float(pd.to_numeric(_template_cap_row.iloc[0].get("selected_by_percent", 0), errors="coerce") or 0.0) if not _template_cap_row.empty else 0.0
+                        _templ_proj = float(pd.to_numeric(_template_cap_row.iloc[0].get("proj_pts", 0), errors="coerce") or 0.0) if not _template_cap_row.empty else 0.0
+                        st.caption(
+                            f"Captaincy scenario: if the template captains **{_template_cap_name}** (~{_templ_own:.0f}% owned), "
+                            f"your choice (**{_my_cap_name}**) is a higher-variance play."
+                        )
 
                 t1, t2 = st.columns(2)
                 with t1:
