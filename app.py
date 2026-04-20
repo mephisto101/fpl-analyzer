@@ -537,19 +537,30 @@ def df_to_csv(df):
 def get_chip_status(used_chips):
     """
     Return dict of chip label -> status string.
+    Uses the manager history `chips` list directly.
 
-    Season is split into two halves (GW1–19 and GW20–38). Each chip can be used once per half.
+    We don't assume a specific rule-set (some seasons/rules have multiple uses).
+    We simply report how many times each chip was played and in which GWs.
     """
     status: dict[str, str] = {}
     for chip_key, chip_label in ALL_CHIPS.items():
-        uses = [c for c in used_chips if c.get('name') == chip_key]
-        first_half = sorted([int(c.get("event", 0)) for c in uses if int(c.get("event", 0)) <= 19])
-        second_half = sorted([int(c.get("event", 0)) for c in uses if int(c.get("event", 0)) >= 20])
+        uses = [c for c in (used_chips or []) if c.get("name") == chip_key]
+        gws = []
+        for u in uses:
+            try:
+                gw = int(u.get("event", 0) or 0)
+            except Exception:
+                gw = 0
+            if gw > 0:
+                gws.append(gw)
+        gws = sorted(set(gws))
 
-        f_txt = f"Used (GW{first_half[0]})" if first_half else "Available"
-        s_txt = f"Used (GW{second_half[0]})" if second_half else "Available"
-
-        status[chip_label] = f"1st half: {f_txt}  |  2nd half: {s_txt}"
+        if not gws:
+            status[chip_label] = "Available"
+        elif len(gws) == 1:
+            status[chip_label] = f"Used (GW{gws[0]})"
+        else:
+            status[chip_label] = "Used (" + ", ".join([f"GW{g}" for g in gws]) + ")"
     return status
 
 # ==========================================
@@ -1148,8 +1159,11 @@ with tabs[0]:
             chip_status = get_chip_status(used_chips)
             chip_cols = st.columns(len(chip_status))
             for col, (chip_label, status) in zip(chip_cols, chip_status.items()):
-                is_used = status.startswith("Used (GW") or status.startswith("1 used")
-                col.metric(chip_label, status if is_used else "Available")
+                col.metric(chip_label, status)
+
+            with st.expander("Chip history (debug)", expanded=False):
+                st.caption("Raw `history['chips']` from the FPL API. If this is empty, the API isn't returning chip usage.")
+                st.json(used_chips[:20])
         except requests.RequestException:
             st.warning("Could not load chip data.")
 
