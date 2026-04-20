@@ -46,9 +46,11 @@ st.markdown("""
     section[data-testid="stSidebar"] {
         background: #0b1220 !important;
     }
-    /* Wider sidebar on desktop only (mobile must stay fluid) */
+    /* Wider sidebar on desktop only (mobile must stay fluid).
+       Important: only apply when sidebar is EXPANDED, otherwise it breaks collapse reflow. */
     @media (min-width: 1100px) {
-        section[data-testid="stSidebar"], section[data-testid="stSidebar"] > div {
+        section[data-testid="stSidebar"][aria-expanded="true"],
+        section[data-testid="stSidebar"][aria-expanded="true"] > div {
             width: 26rem !important;
             min-width: 26rem !important;
         }
