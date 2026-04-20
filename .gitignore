@@ -35,3 +35,4 @@ Desktop.ini
 ## App local data
 .watchlist.json
 .local_settings.json
+.projection_snapshots.json
