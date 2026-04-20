@@ -1418,10 +1418,16 @@ with tabs[1]:
                 )
 
                 total_live = int(live_squad['effective_pts'].sum())
-                bench_live = int(live_squad[live_squad['multiplier'] == 0]['live_pts'].sum())
+                # Bench Boost can set all multipliers > 0, so don't use multiplier==0 to define the bench.
+                bench_mask = live_squad.get("position", pd.Series(index=live_squad.index, data=0)).astype(int) > 11
+                bench_unused = int(live_squad[bench_mask & (live_squad['multiplier'] == 0)]['live_pts'].sum())
+                bench_total = int(live_squad[bench_mask]['live_pts'].sum())
                 lv1, lv2, lv3 = st.columns(3)
                 lv1.metric("Live GW Points", total_live)
-                lv2.metric("Bench Pts (unused)", bench_live)
+                if bench_unused == bench_total and bench_total > 0:
+                    lv2.metric("Bench Pts (unused)", bench_unused)
+                else:
+                    lv2.metric("Bench Pts", bench_total, help="Total bench points. If Bench Boost is active, these count toward your score.")
                 lv3.metric("GW Average", gw_averages.get(curr_gw_id, 'N/A'))
 
                 # Add rich baseline metrics to live tables.
@@ -1452,8 +1458,10 @@ with tabs[1]:
                     'multiplier': 'Mult',
                     'selected_by_percent': 'Own%',
                 }
-                live_starters = live_squad[live_squad['multiplier'] > 0].sort_values('position')
-                live_bench = live_squad[live_squad['multiplier'] == 0].sort_values('position')
+                # Starters/bench should always be based on pick position (1–11 starters, 12–15 bench),
+                # otherwise Bench Boost makes the bench appear empty.
+                live_starters = live_squad[live_squad["position"].astype(int) <= 11].sort_values('position')
+                live_bench = live_squad[live_squad["position"].astype(int) > 11].sort_values('position')
 
                 st.subheader("Starting XI — Live")
                 display_live = live_starters[[c for c in live_cols if c in live_starters.columns]]
