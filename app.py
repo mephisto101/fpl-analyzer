@@ -2242,16 +2242,30 @@ with tab["Mini-League"]:
                         )
                         if _picked and my_id and (TEAM_VIEW_GW_ID or curr_gw_id):
                             for tname in _picked:
-                                tid = str(_name_to_entry.get(tname))
-                                rp = fetch_squad_picks(tid, TEAM_VIEW_GW_ID or curr_gw_id)
+                                tid_raw = _name_to_entry.get(tname)
+                                try:
+                                    tid = int(tid_raw)
+                                except Exception:
+                                    st.warning(f"Could not resolve entry id for {tname}.")
+                                    continue
+
+                                # Picks often 404 for Next GW for other managers; fall back to current GW.
+                                _gw_try_1 = int(TEAM_VIEW_GW_ID or curr_gw_id)
+                                _gw_try_2 = int(curr_gw_id) if curr_gw_id else None
+                                rp = fetch_squad_picks(str(tid), _gw_try_1)
+                                loaded_gw = _gw_try_1
+                                if (not rp) and _gw_try_2 and _gw_try_2 != _gw_try_1:
+                                    rp = fetch_squad_picks(str(tid), _gw_try_2)
+                                    loaded_gw = _gw_try_2 if rp else _gw_try_1
+
                                 if not rp:
-                                    st.warning(f"Could not load picks for {tname}.")
+                                    st.warning(f"Could not load picks for {tname} (tried GW{_gw_try_1}" + (f" and GW{_gw_try_2}" if _gw_try_2 else "") + ").")
                                     continue
                                 r_ids = set([p["element"] for p in rp])
                                 shared = players[players["id"].isin(set(my_player_ids) & r_ids)].copy()
                                 mine = players[players["id"].isin(set(my_player_ids) - r_ids)].copy()
                                 theirs = players[players["id"].isin(r_ids - set(my_player_ids))].copy()
-                                st.markdown(f"**{tname}**")
+                                st.markdown(f"**{tname}** (GW{loaded_gw} picks)")
                                 c1, c2, c3 = st.columns(3)
                                 c1.metric("Shared", int(len(shared)))
                                 c2.metric("Your diffs", int(len(mine)))
