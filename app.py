@@ -4,6 +4,10 @@ import requests
 import plotly.graph_objects as go
 import json
 from pathlib import Path
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+import io
+import zipfile
 
 from fpl.logic import (
     build_one_click_plan_markdown,
@@ -132,6 +136,33 @@ st.markdown("""
 FPL_BASE_URL = "https://fantasy.premierleague.com/api/"
 REQUEST_TIMEOUT = 10
 
+
+def _build_http_session() -> requests.Session:
+    s = requests.Session()
+    retries = Retry(
+        total=3,
+        connect=3,
+        read=3,
+        status=3,
+        backoff_factor=0.4,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=("GET",),
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retries)
+    s.mount("https://", adapter)
+    s.mount("http://", adapter)
+    return s
+
+
+_HTTP = _build_http_session()
+
+
+def _fetch_json(url: str):
+    resp = _HTTP.get(url, timeout=REQUEST_TIMEOUT)
+    resp.raise_for_status()
+    return resp.json()
+
 DIFF_COLORS = {1: '#00753e', 2: '#01fc7a', 3: '#e7e7e7', 4: '#ff1751', 5: '#80072d'}
 DIFF_LIGHT_TEXT = {3}
 
@@ -207,54 +238,38 @@ def save_local_settings(settings: dict, path: str = LOCAL_SETTINGS_PATH) -> None
 # ==========================================
 @st.cache_data(ttl=3600)
 def get_fpl_data():
-    bootstrap_resp = requests.get(f"{FPL_BASE_URL}bootstrap-static/", timeout=REQUEST_TIMEOUT)
-    bootstrap_resp.raise_for_status()
-    fixtures_resp = requests.get(f"{FPL_BASE_URL}fixtures/", timeout=REQUEST_TIMEOUT)
-    fixtures_resp.raise_for_status()
-    return bootstrap_resp.json(), fixtures_resp.json()
+    bootstrap = _fetch_json(f"{FPL_BASE_URL}bootstrap-static/")
+    fixtures = _fetch_json(f"{FPL_BASE_URL}fixtures/")
+    return bootstrap, fixtures
 
 @st.cache_data(ttl=3600)
 def get_manager_history(manager_id):
-    resp = requests.get(f"{FPL_BASE_URL}entry/{manager_id}/history/", timeout=REQUEST_TIMEOUT)
-    resp.raise_for_status()
-    return resp.json()
+    return _fetch_json(f"{FPL_BASE_URL}entry/{manager_id}/history/")
 
 @st.cache_data(ttl=300)
 def get_manager_entry(manager_id):
-    resp = requests.get(f"{FPL_BASE_URL}entry/{manager_id}/", timeout=REQUEST_TIMEOUT)
-    resp.raise_for_status()
-    return resp.json()
+    return _fetch_json(f"{FPL_BASE_URL}entry/{manager_id}/")
 
 @st.cache_data(ttl=300)
 def get_transfer_history(manager_id):
-    resp = requests.get(f"{FPL_BASE_URL}entry/{manager_id}/transfers/", timeout=REQUEST_TIMEOUT)
-    resp.raise_for_status()
-    return resp.json()
+    return _fetch_json(f"{FPL_BASE_URL}entry/{manager_id}/transfers/")
 
 @st.cache_data(ttl=300)
 def get_league_standings(league_id):
-    resp = requests.get(f"{FPL_BASE_URL}leagues-classic/{league_id}/standings/", timeout=REQUEST_TIMEOUT)
-    resp.raise_for_status()
-    return resp.json()
+    return _fetch_json(f"{FPL_BASE_URL}leagues-classic/{league_id}/standings/")
 
 @st.cache_data(ttl=300)
 def get_h2h_standings(league_id):
-    resp = requests.get(f"{FPL_BASE_URL}leagues-h2h/{league_id}/standings/", timeout=REQUEST_TIMEOUT)
-    resp.raise_for_status()
-    return resp.json()
+    return _fetch_json(f"{FPL_BASE_URL}leagues-h2h/{league_id}/standings/")
 
 @st.cache_data(ttl=3600)
 def get_player_history(player_id):
-    resp = requests.get(f"{FPL_BASE_URL}element-summary/{player_id}/", timeout=REQUEST_TIMEOUT)
-    resp.raise_for_status()
-    return resp.json()
+    return _fetch_json(f"{FPL_BASE_URL}element-summary/{player_id}/")
 
 @st.cache_data(ttl=60)
 def get_live_gw_data(gw_id):
     """Live player stats for an active gameweek. Short 60s TTL."""
-    resp = requests.get(f"{FPL_BASE_URL}event/{gw_id}/live/", timeout=REQUEST_TIMEOUT)
-    resp.raise_for_status()
-    return resp.json()
+    return _fetch_json(f"{FPL_BASE_URL}event/{gw_id}/live/")
 
 try:
     data, fixtures_raw = get_fpl_data()
@@ -428,8 +443,53 @@ def _compute_play_prob(row: pd.Series) -> float:
     """
     base = float(pd.to_numeric(row.get("chance_of_playing_next_round", 100), errors="coerce") or 100.0)
     avg_mins = float(pd.to_numeric(row.get("avg_minutes", 90), errors="coerce") or 90.0)
-    mins_factor = max(0.2, min(1.0, avg_mins / 75.0))
-    return round(max(0.0, min(1.0, (base / 100.0) * mins_factor)), 2)
+    news = str(row.get("news", "") or "")
+    rot = str(row.get("rotation_risk", "") or "")
+
+    # Minutes factor: below ~30 mins is very risky, 75+ is solid.
+    mins_factor = max(0.15, min(1.0, avg_mins / 75.0))
+
+    # Rotation/news penalties (heuristics).
+    penalty = 1.0
+    if "Low mins" in rot:
+        penalty *= 0.85
+    if news and news.lower() not in ("nan", "none"):
+        penalty *= 0.9
+
+    p = (base / 100.0) * mins_factor * penalty
+    return round(max(0.0, min(1.0, p)), 2)
+
+
+def _confidence_tier_from_play_prob(play_prob: float) -> str:
+    if play_prob >= 0.8:
+        return "High"
+    if play_prob >= 0.6:
+        return "Medium"
+    return "Low"
+
+
+def _variance_flags_for_team(*, team_id: int, horizon_gws: int) -> list[str]:
+    """
+    DGW/Blank variance flags over the projection horizon.
+    """
+    flags: list[str] = []
+    try:
+        curr_gw = next((e["id"] for e in data["events"] if e.get("is_current")), None)
+        if not curr_gw:
+            return flags
+        for gw in range(curr_gw + 1, curr_gw + 1 + int(horizon_gws)):
+            gw_fixtures = [f for f in fixtures_raw if f.get("event") == gw]
+            if not gw_fixtures:
+                continue
+            teams_in_gw = [f["team_h"] for f in gw_fixtures] + [f["team_a"] for f in gw_fixtures]
+            counts = pd.Series(teams_in_gw).value_counts()
+            if int(team_id) not in counts.index:
+                flags.append(f"Blank in GW{gw}")
+            elif int(counts.loc[int(team_id)]) > 1:
+                flags.append(f"DGW in GW{gw}")
+    except Exception:
+        return flags
+    return flags
 
 
 def gw_status_for(gw_id: int | None) -> dict:
@@ -511,6 +571,7 @@ def add_projection_columns(df: pd.DataFrame, *, horizon_gws: int) -> pd.DataFram
         return df.copy()
     proj = df.copy()
     proj["play_prob"] = proj.apply(_compute_play_prob, axis=1)
+    proj["confidence_tier"] = proj["play_prob"].apply(lambda p: _confidence_tier_from_play_prob(float(p)))
     # If we don't have team ids, fall back to a form-only projection.
     if "team" not in proj.columns:
         proj["proj_pts"] = (pd.to_numeric(proj.get("form", 0), errors="coerce").fillna(0) * float(horizon_gws) * proj["play_prob"]).round(1)
@@ -519,15 +580,14 @@ def add_projection_columns(df: pd.DataFrame, *, horizon_gws: int) -> pd.DataFram
     gw_ids, w = build_team_fixture_weights(fixtures=fixtures_raw, data=data, horizon_gws=horizon_gws)
     proj["_fixture_weight_sum"] = proj["team"].apply(lambda tid: float(sum(w.get(int(tid), [0.0] * horizon_gws))))
     proj["proj_pts"] = (proj["form"] * proj["_fixture_weight_sum"] * proj["play_prob"]).round(1)
+    proj["variance_flags"] = proj["team"].apply(lambda tid: ", ".join(_variance_flags_for_team(team_id=int(tid), horizon_gws=int(horizon_gws))) or "—")
     proj = proj.drop(columns=["_fixture_weight_sum"])
     return proj
 
 def fetch_squad_picks(manager_id, gw_id):
     url = f"{FPL_BASE_URL}entry/{manager_id}/event/{gw_id}/picks/"
     try:
-        resp = requests.get(url, timeout=REQUEST_TIMEOUT)
-        resp.raise_for_status()
-        return resp.json().get('picks', [])
+        return _fetch_json(url).get("picks", [])
     except requests.RequestException:
         return None
 
@@ -569,6 +629,55 @@ def get_chip_status(used_chips):
 _local_settings = load_local_settings()
 
 st.sidebar.header("Manager Settings")
+
+# --- Saved Profiles ---
+profiles: dict = _local_settings.get("profiles", {}) if isinstance(_local_settings.get("profiles", {}), dict) else {}
+profile_names = ["(default)"] + sorted([str(k) for k in profiles.keys()])
+picked_profile = st.sidebar.selectbox(
+    "Profile",
+    options=profile_names,
+    index=0,
+    help="Save/load multiple manager setups (manager/rival/league + key settings).",
+    key="profile_pick",
+)
+
+if picked_profile != "(default)":
+    p = profiles.get(picked_profile, {})
+    if isinstance(p, dict):
+        if p.get("manager_id"):
+            st.query_params["id"] = str(p.get("manager_id"))
+            _local_settings["manager_id"] = str(p.get("manager_id"))
+        if p.get("rival_id"):
+            st.query_params["rival"] = str(p.get("rival_id"))
+            _local_settings["rival_id"] = str(p.get("rival_id"))
+        if p.get("league_id"):
+            st.query_params["league"] = str(p.get("league_id"))
+            _local_settings["league_id"] = str(p.get("league_id"))
+        if p.get("fixture_lookahead"):
+            _local_settings["fixture_lookahead"] = int(p.get("fixture_lookahead"))
+        if isinstance(p.get("thresholds"), dict):
+            _local_settings["thresholds"] = p.get("thresholds")
+
+with st.sidebar.expander("Profiles", expanded=False):
+    new_profile_name = st.text_input("Save current as", value="", key="profile_new_name")
+    c1, c2 = st.columns(2)
+    if c1.button("Save", use_container_width=True, key="profile_save_btn") and new_profile_name.strip():
+        profiles[new_profile_name.strip()] = {
+            "manager_id": str(_local_settings.get("manager_id", "")),
+            "rival_id": str(_local_settings.get("rival_id", "")),
+            "league_id": str(_local_settings.get("league_id", "")),
+            "fixture_lookahead": int(_local_settings.get("fixture_lookahead", 5)),
+            "thresholds": _local_settings.get("thresholds", {}),
+        }
+        _local_settings["profiles"] = profiles
+        save_local_settings(_local_settings)
+        st.success("Profile saved.")
+    if c2.button("Delete", use_container_width=True, key="profile_delete_btn") and picked_profile != "(default)":
+        profiles.pop(picked_profile, None)
+        _local_settings["profiles"] = profiles
+        save_local_settings(_local_settings)
+        st.warning("Profile deleted.")
+
 my_id = st.sidebar.text_input(
     "Manager ID",
     value=str(st.query_params.get("id", _local_settings.get("manager_id", ""))),
@@ -751,11 +860,11 @@ with tabs[0]:
         bench = my_squad[my_squad['multiplier'] == 0].sort_values('position')
 
         st.subheader("Starting XI")
-        st.dataframe(get_display_df(starters, squad_cols), use_container_width=True, hide_index=True)
+        st.dataframe(get_display_df(starters, squad_cols), width="stretch", hide_index=True)
 
         # --- Bench Analysis ---
         st.subheader("Bench")
-        st.dataframe(get_display_df(bench, squad_cols), use_container_width=True, hide_index=True)
+        st.dataframe(get_display_df(bench, squad_cols), width="stretch", hide_index=True)
 
         bb_estimate = round(bench['form'].sum(), 1)
         bench_season_pts = int(bench['total_points'].sum())
@@ -785,7 +894,7 @@ with tabs[0]:
             xaxis_tickangle=-35, legend=dict(orientation='h'),
             margin=dict(l=40, r=40, t=20, b=100),
         )
-        st.plotly_chart(fig_form_avg, use_container_width=True)
+        st.plotly_chart(fig_form_avg, width="stretch")
 
         # --- XI Optimizer + Bench Order ---
         st.markdown("---")
@@ -816,6 +925,8 @@ with tabs[0]:
             "price",
             "proj_pts",
             "play_prob",
+            "confidence_tier",
+            "variance_flags",
             "xpts",
             "form",
             "expected_goals",
@@ -826,14 +937,14 @@ with tabs[0]:
             "selected_by_percent",
         ]
         st.subheader("Suggested Starting XI")
-        st.dataframe(get_display_df(xi_df, xi_cols), use_container_width=True, hide_index=True)
+        st.dataframe(get_display_df(xi_df, xi_cols), width="stretch", hide_index=True)
 
         st.subheader("Suggested Bench Order")
         b = bench_df.copy()
         b_gk = b[b["pos"] == "GKP"].sort_values("proj_pts", ascending=False)
         b_out = b[b["pos"] != "GKP"].sort_values("proj_pts", ascending=False)
         bench_ordered = pd.concat([b_out, b_gk], ignore_index=True)
-        st.dataframe(get_display_df(bench_ordered, xi_cols), use_container_width=True, hide_index=True)
+        st.dataframe(get_display_df(bench_ordered, xi_cols), width="stretch", hide_index=True)
 
         st.download_button(
             "Download XI plan CSV",
@@ -901,7 +1012,7 @@ with tabs[0]:
                                     max_ict=_max_ict,
                                     home_captain_bonus=float(HOME_CAPTAIN_BONUS),
                                 )
-                                st.dataframe(rb, use_container_width=True, hide_index=True)
+                                st.dataframe(rb, width="stretch", hide_index=True)
 
                 st.markdown("---")
                 st.subheader("Captaincy Matrix")
@@ -922,6 +1033,7 @@ with tabs[0]:
                     "Confidence",
                     "confidence_tier",
                     "confidence_flags",
+                    "variance_flags",
                     "Captain Rank Score",
                 ]
                 st.dataframe(
@@ -956,7 +1068,7 @@ with tabs[0]:
                             max_ict=_max_ict,
                             home_captain_bonus=float(HOME_CAPTAIN_BONUS),
                         )
-                        st.dataframe(rb, use_container_width=True, hide_index=True)
+                        st.dataframe(rb, width="stretch", hide_index=True)
                     with r2:
                         st.markdown("**Confidence + context**")
                         st.metric("Confidence tier", _row.get("confidence_tier", "—"))
@@ -1055,6 +1167,54 @@ with tabs[0]:
                     help="Exports the weekly plan as a Markdown file.",
                 )
 
+                # --- Export bundle (ZIP) ---
+                with st.expander("Export bundle", expanded=False):
+                    st.caption("Download a single zip with your weekly plan and key tables.")
+                    try:
+                        _players_proj = add_projection_columns(players.copy(), horizon_gws=2)
+                        _eo_local = eo_risk_panel(
+                            players=_players_proj,
+                            my_squad_ids=set([int(x) for x in my_player_ids]),
+                            captain_id=int(captain["id"]) if captain is not None else None,
+                            template_top_n=30,
+                            differential_own_cutoff=float(DIFF_MAX_OWNERSHIP),
+                        )
+                        bundle = io.BytesIO()
+                        with zipfile.ZipFile(bundle, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+                            gw_tag = f"gw{next_gw['id']}" if next_gw else "gwna"
+                            zf.writestr(f"{gw_tag}/weekly_plan.md", plan_md)
+                            # Captaincy matrix (top 15)
+                            zf.writestr(
+                                f"{gw_tag}/captaincy_matrix.csv",
+                                get_display_df(_matrix.sort_values("Captain Rank Score", ascending=False), mcols).to_csv(index=False),
+                            )
+                            # EO tables
+                            zf.writestr(
+                                f"{gw_tag}/eo_threats.csv",
+                                get_display_df(_eo_local["threats_df"], ["web_name", "team_name", "pos", "selected_by_percent", "proj_pts", "confidence_tier", "variance_flags", "threat_score"]).to_csv(index=False),
+                            )
+                            zf.writestr(
+                                f"{gw_tag}/eo_differentials.csv",
+                                get_display_df(_eo_local["differentials_df"], ["web_name", "team_name", "pos", "selected_by_percent", "proj_pts", "confidence_tier", "variance_flags", "play_prob"]).to_csv(index=False),
+                            )
+                            # XI plan
+                            zf.writestr(
+                                f"{gw_tag}/xi_bench_plan.csv",
+                                get_display_df(
+                                    pd.concat([xi_df.assign(role="Starting XI"), bench_ordered.assign(role="Bench")]),
+                                    ["role"] + xi_cols,
+                                ).to_csv(index=False),
+                            )
+                        bundle.seek(0)
+                        st.download_button(
+                            "Download weekly bundle.zip",
+                            data=bundle.getvalue(),
+                            file_name=f"weekly_bundle_{gw_tag}.zip",
+                            mime="application/zip",
+                        )
+                    except Exception as e:
+                        st.warning(f"Could not build export bundle: {e}")
+
                 # --- Chip Simulators (lightweight heuristics) ---
                 with st.expander("Chip simulators (estimates)", expanded=False):
                     st.caption("Heuristic estimates based on projected points. Use as guidance, not a guarantee.")
@@ -1088,6 +1248,11 @@ with tabs[0]:
                             )
                             if len(blanks) > 0:
                                 st.caption("Blanking: " + ", ".join(blanks["web_name"].tolist()))
+                    # Variance note
+                    if "variance_flags" in squad_proj.columns:
+                        _var = squad_proj["variance_flags"].astype(str)
+                        if _var.str.contains("DGW").any():
+                            st.info("DGW variance: projections may be higher but minutes risk is also higher (rotation/early subs).")
 
                 # --- EO / Template Risk Panel ---
                 st.markdown("---")
@@ -1139,12 +1304,56 @@ with tabs[0]:
                 t1, t2 = st.columns(2)
                 with t1:
                     st.subheader("Top threats (template players you don't own)")
-                    threats_cols = ["web_name", "team_name", "pos", "selected_by_percent", "proj_pts", "threat_score"]
-                    st.dataframe(get_display_df(eo["threats_df"], threats_cols), use_container_width=True, hide_index=True)
+                    threats_cols = ["web_name", "team_name", "pos", "selected_by_percent", "proj_pts", "confidence_tier", "variance_flags", "threat_score"]
+                    st.dataframe(get_display_df(eo["threats_df"], threats_cols), width="stretch", hide_index=True)
                 with t2:
                     st.subheader("Your differentials (low-owned upside)")
-                    diff_cols = ["web_name", "team_name", "pos", "selected_by_percent", "proj_pts", "play_prob"]
-                    st.dataframe(get_display_df(eo["differentials_df"], diff_cols), use_container_width=True, hide_index=True)
+                    diff_cols = ["web_name", "team_name", "pos", "selected_by_percent", "proj_pts", "confidence_tier", "variance_flags", "play_prob"]
+                    st.dataframe(get_display_df(eo["differentials_df"], diff_cols), width="stretch", hide_index=True)
+
+                # EO threat explainability (on demand)
+                with st.expander("Why is a player a threat?", expanded=False):
+                    _th = eo["threats_df"].copy()
+                    if not _th.empty:
+                        _th_names = _th["web_name"].tolist()
+                        _th_pick = st.selectbox("Threat player", options=_th_names, index=0, key="eo_threat_pick")
+                        _row = _th[_th["web_name"] == _th_pick].head(1).iloc[0]
+                        st.markdown(f"**{_th_pick}**")
+                        st.caption(f"Ownership: {float(_row.get('selected_by_percent', 0)):.1f}%")
+                        st.caption(f"Projection: {float(_row.get('proj_pts', 0)):.1f} | Confidence: {_row.get('confidence_tier', '—')} | Variance: {_row.get('variance_flags', '—')}")
+                        st.caption(f"Threat score ≈ ownership × projection: {float(_row.get('threat_score', 0)):.1f}")
+                    else:
+                        st.info("No threats found.")
+
+                # --- Threat Radar (summary) ---
+                st.markdown("---")
+                st.header("Threat Radar")
+                st.caption("Quick answers: what can hurt you this week, and where your upside is coming from.")
+                r1, r2, r3 = st.columns(3)
+                # Blanks / DGW in your squad next GW
+                if next_gw:
+                    _gw = next_gw["id"]
+                    _st = gw_status_for(_gw)
+                    _active = _st["active_team_ids"]
+                    _blanks = my_squad[~my_squad["team"].isin(_active)] if _active else pd.DataFrame()
+                    _dgw_team_ids = set(_st["dgw_team_ids"])
+                    _dgw_players = my_squad[my_squad["team"].isin(_dgw_team_ids)] if _dgw_team_ids else pd.DataFrame()
+                    r1.metric("Blanking players", int(len(_blanks)), help="Players in your squad with no fixture next GW.")
+                    r2.metric("DGW players", int(len(_dgw_players)), help="Players in your squad whose team has a DGW next GW.")
+                else:
+                    r1.metric("Blanking players", "—")
+                    r2.metric("DGW players", "—")
+                # Captaincy threat
+                r3.metric(
+                    "Template captain owned?",
+                    "Yes" if _template_cap_owned else "No",
+                    help="Based on the assumed template captain in the EO panel.",
+                )
+
+                if next_gw and not _blanks.empty:
+                    st.warning("Blanking: " + ", ".join(_blanks["web_name"].tolist()))
+                if next_gw and not _dgw_players.empty:
+                    st.info("DGW squad: " + ", ".join(_dgw_players["web_name"].tolist()))
             except (KeyError, ValueError):
                 st.info("Fixture data pending.")
         else:
@@ -1246,11 +1455,11 @@ with tabs[1]:
 
                 st.subheader("Starting XI — Live")
                 display_live = live_starters[[c for c in live_cols if c in live_starters.columns]]
-                st.dataframe(display_live.rename(columns=live_rename), use_container_width=True, hide_index=True)
+                st.dataframe(display_live.rename(columns=live_rename), width="stretch", hide_index=True)
 
                 st.subheader("Bench — Live")
                 display_bench = live_bench[[c for c in live_cols if c in live_bench.columns]]
-                st.dataframe(display_bench.rename(columns=live_rename), use_container_width=True, hide_index=True)
+                st.dataframe(display_bench.rename(columns=live_rename), width="stretch", hide_index=True)
             else:
                 st.info("Enter your Manager ID in the sidebar to see live squad points.")
 
@@ -1341,7 +1550,7 @@ with tabs[2]:
                     legend=dict(orientation='h'),
                     margin=dict(l=40, r=40, t=40, b=40),
                 )
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, width="stretch")
 
                 # Rank chart
                 fig2 = go.Figure()
@@ -1355,7 +1564,7 @@ with tabs[2]:
                     yaxis=dict(title="Rank", autorange='reversed'),
                     margin=dict(l=40, r=40, t=40, b=40),
                 )
-                st.plotly_chart(fig2, use_container_width=True)
+                st.plotly_chart(fig2, width="stretch")
 
                 # --- Position Efficiency Breakdown ---
                 st.markdown("---")
@@ -1384,7 +1593,7 @@ with tabs[2]:
                         xaxis_title="Position", yaxis_title="Total Points",
                         margin=dict(l=40, r=40, t=40, b=40),
                     )
-                    st.plotly_chart(fig_pos, use_container_width=True)
+                    st.plotly_chart(fig_pos, width="stretch")
                     st.caption("Shows the season-to-date totals for your current squad players grouped by position.")
                 else:
                     st.info("Load your squad (Manager ID) to see position breakdown.")
@@ -1399,7 +1608,7 @@ with tabs[2]:
                     'event_transfers': 'Transfers', 'event_transfers_cost': 'Hit Cost',
                 }
                 st.subheader("Full GW Breakdown")
-                st.dataframe(hist_df[available].rename(columns=rename), use_container_width=True, hide_index=True)
+                st.dataframe(hist_df[available].rename(columns=rename), width="stretch", hide_index=True)
                 st.download_button(
                     "Download History CSV",
                     df_to_csv(hist_df[available].rename(columns=rename)),
@@ -1433,7 +1642,7 @@ with tabs[2]:
                         legend=dict(orientation='h'),
                         margin=dict(l=40, r=40, t=40, b=40),
                     )
-                    st.plotly_chart(fig_hits, use_container_width=True)
+                    st.plotly_chart(fig_hits, width="stretch")
 
                 # Transfer history
                 st.markdown("---")
@@ -1526,7 +1735,7 @@ with tabs[3]:
     # Add projections for richer scouting
     scout_df = add_projection_columns(scout_df, horizon_gws=3)
     sorted_scout = scout_df.sort_values(_sort_opts[scout_sort], ascending=False)
-    st.dataframe(get_display_df(sorted_scout, scout_cols), use_container_width=True, hide_index=True)
+    st.dataframe(get_display_df(sorted_scout, scout_cols), width="stretch", hide_index=True)
     st.download_button(
         "Download Scout CSV",
         df_to_csv(get_display_df(sorted_scout, scout_cols)),
@@ -1556,7 +1765,7 @@ with tabs[3]:
             "expected_goals_conceded",
             "total_points", "selected_by_percent", "chance_of_playing_next_round",
         ]
-        st.dataframe(get_display_df(_cmp, _cmp_cols), use_container_width=True, hide_index=True)
+        st.dataframe(get_display_df(_cmp, _cmp_cols), width="stretch", hide_index=True)
         st.download_button(
             "Download Compare CSV",
             df_to_csv(get_display_df(_cmp, _cmp_cols)),
@@ -1592,7 +1801,7 @@ with tabs[3]:
         xaxis_title="Price (£m)", yaxis_title="Total Points",
         legend=dict(orientation='h'), margin=dict(l=40, r=40, t=20, b=40),
     )
-    st.plotly_chart(fig_scatter, use_container_width=True)
+    st.plotly_chart(fig_scatter, width="stretch")
 
     # --- Differential Finder ---
     st.markdown("---")
@@ -1621,11 +1830,11 @@ with tabs[3]:
     with hc1:
         st.markdown("**Hottest Players (form above season avg)**")
         hot_df = scout_df[scout_df['form_trend'] > 0].nlargest(10, 'form_trend')
-        st.dataframe(get_display_df(hot_df, hc_cols), use_container_width=True, hide_index=True)
+        st.dataframe(get_display_df(hot_df, hc_cols), width="stretch", hide_index=True)
     with hc2:
         st.markdown("**Coldest Players (form below season avg)**")
         cold_df = scout_df[scout_df['form_trend'] < 0].nsmallest(10, 'form_trend')
-        st.dataframe(get_display_df(cold_df, hc_cols), use_container_width=True, hide_index=True)
+        st.dataframe(get_display_df(cold_df, hc_cols), width="stretch", hide_index=True)
 
     # --- Template Comparison ---
     st.markdown("---")
@@ -1652,11 +1861,11 @@ with tabs[4]:
     with pc1:
         st.subheader("Rising — This GW")
         rising = players[players['cost_change_event'] > 0].sort_values('cost_change_event', ascending=False)
-        st.dataframe(get_display_df(rising, rising_cols), use_container_width=True, hide_index=True)
+        st.dataframe(get_display_df(rising, rising_cols), width="stretch", hide_index=True)
     with pc2:
         st.subheader("Falling — This GW")
         falling = players[players['cost_change_event'] < 0].sort_values('cost_change_event')
-        st.dataframe(get_display_df(falling, rising_cols), use_container_width=True, hide_index=True)
+        st.dataframe(get_display_df(falling, rising_cols), width="stretch", hide_index=True)
 
     st.markdown("---")
     st.subheader("Biggest Movers Since Season Start")
@@ -1664,7 +1873,7 @@ with tabs[4]:
     movers['abs_change'] = movers['cost_change_start'].abs()
     movers = movers.sort_values('abs_change', ascending=False).head(20)
     mover_cols = ['web_name', 'team_name', 'pos', 'price', 'cost_change_start', 'form', 'selected_by_percent']
-    st.dataframe(get_display_df(movers, mover_cols), use_container_width=True, hide_index=True)
+    st.dataframe(get_display_df(movers, mover_cols), width="stretch", hide_index=True)
 
     # --- Price Rise Predictor ---
     st.markdown("---")
@@ -1683,7 +1892,7 @@ with tabs[4]:
     else:
         rise_candidates = no_change.sort_values('selected_by_percent', ascending=False).head(20)
         rise_cols = ['web_name', 'team_name', 'pos', 'price', 'selected_by_percent', 'form']
-    st.dataframe(get_display_df(rise_candidates, rise_cols), use_container_width=True, hide_index=True)
+    st.dataframe(get_display_df(rise_candidates, rise_cols), width="stretch", hide_index=True)
 
 # ── TAB 5: TICKER ───────────────────────────────────────────────────────────
 with tabs[5]:
@@ -1712,7 +1921,7 @@ with tabs[5]:
         })
     if _warning_rows:
         _warn_df = pd.DataFrame(_warning_rows)
-        st.dataframe(_warn_df, use_container_width=True, hide_index=True)
+        st.dataframe(_warn_df, width="stretch", hide_index=True)
         _next_dgw = next((_r for _r in _warning_rows if _r['# DGW'] > 0), None)
         _next_blank = next((_r for _r in _warning_rows if _r['# Blank'] > 0), None)
         if _next_dgw:
@@ -1748,7 +1957,7 @@ with tabs[5]:
         .map(style_ticker, subset=fixture_subset)
         .apply(style_ticker_row, my_team_names=my_team_names, axis=1)
     )
-    st.dataframe(styled, use_container_width=True, hide_index=True)
+    st.dataframe(styled, width="stretch", hide_index=True)
     if my_team_names:
         st.caption("Bold green border = team in your squad.")
     if sort_by_difficulty:
@@ -1866,7 +2075,7 @@ with tabs[6]:
             polar=dict(radialaxis=dict(visible=True, range=[0, players[RADAR_METRICS].max().max()])),
             showlegend=True, margin=dict(l=40, r=40, t=40, b=40),
         )
-        st.plotly_chart(fig_v, use_container_width=True)
+        st.plotly_chart(fig_v, width="stretch")
 
         st.subheader("Stats Comparison")
         compare_cols = [
@@ -1878,7 +2087,7 @@ with tabs[6]:
         ]
         p1_row = players[(players['web_name'] == p1) & (players['team_name'] == tm1)]
         p2_row = players[(players['web_name'] == p2) & (players['team_name'] == tm2)]
-        st.dataframe(get_display_df(pd.concat([p1_row, p2_row]), compare_cols), use_container_width=True, hide_index=True)
+        st.dataframe(get_display_df(pd.concat([p1_row, p2_row]), compare_cols), width="stretch", hide_index=True)
 
         # GW-by-GW points chart
         st.subheader("GW Points — This Season")
@@ -1902,7 +2111,7 @@ with tabs[6]:
             xaxis_title="Gameweek", yaxis_title="Points",
             legend=dict(orientation='h'), margin=dict(l=40, r=40, t=20, b=40),
         )
-        st.plotly_chart(gw_fig, use_container_width=True)
+        st.plotly_chart(gw_fig, width="stretch")
 
 # ── TAB 7: MINI-LEAGUE ──────────────────────────────────────────────────────
 with tabs[7]:
@@ -1937,9 +2146,46 @@ with tabs[7]:
                             lambda x: f"+{x}" if x > 0 else str(x)
                         )
                     st.subheader(league_name)
-                    st.dataframe(league_display, use_container_width=True, hide_index=True)
+                    st.dataframe(league_display, width="stretch", hide_index=True)
                     st.download_button("Download Standings CSV", df_to_csv(league_display),
                                        file_name=f"{league_name}_standings.csv", mime="text/csv")
+
+                    # --- Mini-league target mode (simplified) ---
+                    st.markdown("---")
+                    st.subheader("Target Mode (top rivals)")
+                    st.caption("Pick a few rivals from this league to compare squads and spot differentials.")
+                    try:
+                        _name_to_entry = dict(zip(league_df["entry_name"], league_df["entry"]))
+                        _choices = league_df["entry_name"].head(20).tolist()
+                        _picked = st.multiselect(
+                            "Rivals to target (max 3)",
+                            options=_choices,
+                            default=_choices[:1],
+                            help="We will fetch their current GW picks and compare to your squad.",
+                            max_selections=3,
+                            key="league_target_pick",
+                        )
+                        if _picked and my_id and curr_gw_event:
+                            for tname in _picked:
+                                tid = str(_name_to_entry.get(tname))
+                                rp = fetch_squad_picks(tid, curr_gw_id)
+                                if not rp:
+                                    st.warning(f"Could not load picks for {tname}.")
+                                    continue
+                                r_ids = set([p["element"] for p in rp])
+                                shared = players[players["id"].isin(set(my_player_ids) & r_ids)].copy()
+                                mine = players[players["id"].isin(set(my_player_ids) - r_ids)].copy()
+                                theirs = players[players["id"].isin(r_ids - set(my_player_ids))].copy()
+                                st.markdown(f"**{tname}**")
+                                c1, c2, c3 = st.columns(3)
+                                c1.metric("Shared", int(len(shared)))
+                                c2.metric("Your diffs", int(len(mine)))
+                                c3.metric("Their diffs", int(len(theirs)))
+                                st.dataframe(get_display_df(theirs, ["web_name", "team_name", "pos", "price", "proj_pts", "confidence_tier", "variance_flags", "selected_by_percent"]), width="stretch", hide_index=True)
+                        elif _picked and (not my_id or not curr_gw_event):
+                            st.info("Enter your Manager ID and ensure a current GW is detected to compare squads.")
+                    except Exception:
+                        st.info("Target mode unavailable for this league data.")
 
                     # --- Mini-League Form Table (last 5 GWs) ---
                     st.markdown("---")
@@ -1964,7 +2210,7 @@ with tabs[7]:
                         prog.empty()
                         if form_rows:
                             form_df = pd.DataFrame(form_rows).set_index('Team')
-                            st.dataframe(form_df, use_container_width=True)
+                            st.dataframe(form_df, width="stretch")
                         else:
                             st.warning("Could not load form data.")
                 else:
@@ -1983,7 +2229,7 @@ with tabs[7]:
                     available = [c for c in h2h_col_map if c in h2h_df.columns]
                     h2h_display = h2h_df[available].rename(columns=h2h_col_map)
                     st.subheader(league_name)
-                    st.dataframe(h2h_display, use_container_width=True, hide_index=True)
+                    st.dataframe(h2h_display, width="stretch", hide_index=True)
                     st.download_button("Download H2H Standings CSV", df_to_csv(h2h_display),
                                        file_name=f"{league_name}_h2h.csv", mime="text/csv")
                 else:
@@ -2021,11 +2267,33 @@ with tabs[8]:
             ]
 
             st.subheader("Shield (Shared Assets)")
-            st.dataframe(get_display_df(players[players['id'].isin(my_set & riv_set)], riv_cols), use_container_width=True, hide_index=True)
+            st.dataframe(get_display_df(players[players['id'].isin(my_set & riv_set)], riv_cols), width="stretch", hide_index=True)
             st.subheader("Your Sword (Differentials)")
-            st.dataframe(get_display_df(players[players['id'].isin(my_set - riv_set)], riv_cols), use_container_width=True, hide_index=True)
+            st.dataframe(get_display_df(players[players['id'].isin(my_set - riv_set)], riv_cols), width="stretch", hide_index=True)
             st.subheader("Danger (Rival Differentials)")
-            st.dataframe(get_display_df(players[players['id'].isin(riv_set - my_set)], riv_cols), use_container_width=True, hide_index=True)
+            st.dataframe(get_display_df(players[players['id'].isin(riv_set - my_set)], riv_cols), width="stretch", hide_index=True)
+
+            # --- Rival swing analysis (simplified) ---
+            st.markdown("---")
+            st.subheader("Captaincy swing — you vs rival")
+            st.caption("Uses short-horizon projections as a rough swing estimate (not guaranteed).")
+            _my_proj = add_projection_columns(players[players["id"].isin(my_player_ids)].copy(), horizon_gws=2)
+            _riv_proj = add_projection_columns(players[players["id"].isin(list(riv_ids))].copy(), horizon_gws=2)
+            _my_cap = _my_proj.sort_values(["proj_pts", "play_prob"], ascending=[False, False]).head(1)
+            _riv_cap = _riv_proj.sort_values(["proj_pts", "play_prob"], ascending=[False, False]).head(1)
+            if not _my_cap.empty and not _riv_cap.empty:
+                my_cap_name = _my_cap.iloc[0]["web_name"]
+                riv_cap_name = _riv_cap.iloc[0]["web_name"]
+                my_cap_pts = float(_my_cap.iloc[0]["proj_pts"])
+                riv_cap_pts = float(_riv_cap.iloc[0]["proj_pts"])
+                # Approx swing if you captain your pick and rival captains theirs: +2*mine - 2*rival
+                swing = round(2 * my_cap_pts - 2 * riv_cap_pts, 1)
+                s1, s2, s3 = st.columns(3)
+                s1.metric("Your projected captain", f"{my_cap_name} ({my_cap_pts:.1f})")
+                s2.metric("Rival projected captain", f"{riv_cap_name} ({riv_cap_pts:.1f})")
+                s3.metric("Est. captain swing", swing, help="Approx: 2×(your cap proj − rival cap proj).")
+            else:
+                st.info("Could not compute captain swing (missing projection inputs).")
 
             # --- Rival Rank History ---
             st.markdown("---")
@@ -2051,7 +2319,7 @@ with tabs[8]:
                     legend=dict(orientation='h'),
                     margin=dict(l=40, r=40, t=40, b=40),
                 )
-                st.plotly_chart(fig_rank, use_container_width=True)
+                st.plotly_chart(fig_rank, width="stretch")
             except (requests.RequestException, KeyError):
                 st.warning("Could not load rank history for one or both managers.")
 
@@ -2088,7 +2356,7 @@ with tabs[9]:
             'ppm', 'efficiency',
             'avg_minutes', 'rotation_risk', 'selected_by_percent',
         ]
-        st.dataframe(get_display_df(candidates, drop_cols), use_container_width=True, hide_index=True)
+        st.dataframe(get_display_df(candidates, drop_cols), width="stretch", hide_index=True)
 
         st.subheader("Recommended Replacements (per candidate)")
         for _, worst in candidates.iterrows():
@@ -2117,7 +2385,54 @@ with tabs[9]:
                 if is_def_gkp:
                     t_cols.insert(-1, 'cs_prob')
                 display = get_display_df(targets, t_cols)
-                st.dataframe(display, use_container_width=True, hide_index=True)
+                st.dataframe(display, width="stretch", hide_index=True)
+
+                # On-demand explainability: compare one target vs the sell player
+                with st.expander("Why this replacement?", expanded=False):
+                    _opts = targets["web_name"].tolist()
+                    if _opts:
+                        _pick = st.selectbox(
+                            "Target to explain",
+                            options=_opts,
+                            index=0,
+                            key=f"why_pick_{worst['web_name']}",
+                            help="Shows a side-by-side comparison of the sell vs selected buy candidate.",
+                        )
+                        _buy = targets[targets["web_name"] == _pick].head(1)
+                        _sell = worst.to_frame().T.copy()
+                        if not _buy.empty:
+                            cmp = pd.concat(
+                                [
+                                    _sell.assign(role="Sell"),
+                                    _buy.assign(role="Buy"),
+                                ],
+                                ignore_index=True,
+                            )
+                            cmp_cols = [
+                                "role",
+                                "web_name",
+                                "team_name",
+                                "pos",
+                                "price",
+                                "proj_pts",
+                                "confidence_tier",
+                                "variance_flags",
+                                "play_prob",
+                                "form",
+                                "ict_index",
+                                "expected_goals",
+                                "expected_assists",
+                                "avg_minutes",
+                                "rotation_risk",
+                                "selected_by_percent",
+                                "next_3_fixtures",
+                            ]
+                            st.dataframe(get_display_df(cmp, cmp_cols), width="stretch", hide_index=True)
+                            st.caption(
+                                f"Projected gain (horizon): {float(_buy.iloc[0]['proj_pts']) - float(_sell.iloc[0].get('proj_pts', 0)):.1f} points."
+                            )
+                    else:
+                        st.info("No targets available to explain under current constraints.")
                 st.download_button(
                     f"Download targets for {worst['web_name']}",
                     df_to_csv(display),
@@ -2166,7 +2481,7 @@ with tabs[9]:
         outs = squad_proj.sort_values(["value_proj", "proj_pts"], ascending=[True, True]).head(5).copy()
         st.subheader("Suggested players to consider selling")
         out_cols = ["web_name", "team_name", "pos", "price", "proj_pts", "play_prob", "avg_minutes", "rotation_risk", "value_proj"]
-        st.dataframe(get_display_df(outs, out_cols), use_container_width=True, hide_index=True)
+        st.dataframe(get_display_df(outs, out_cols), width="stretch", hide_index=True)
 
         st.subheader("Best replacements (by projected points)")
         planned_transfers = []
@@ -2214,7 +2529,7 @@ with tabs[9]:
             k2.metric("Estimated hit cost", hit_penalty, help="Only applies when transfers exceed free transfers and hits are enabled.")
             k3.metric("Net projected gain", round(total_gain, 1), help="Sum of projected gains minus hit cost.")
 
-            st.dataframe(plan_df, use_container_width=True, hide_index=True)
+            st.dataframe(plan_df, width="stretch", hide_index=True)
             st.download_button(
                 "Download transfer plan CSV",
                 df_to_csv(plan_df),
@@ -2223,6 +2538,132 @@ with tabs[9]:
             )
         else:
             st.info("No transfer suggestions found under your current budget/filters.")
+
+        # --- Transfer Impact Simulator (1–3 transfers) ---
+        st.markdown("---")
+        st.header("Transfer Impact Simulator")
+        st.caption("Pick transfers and see the projected impact on your optimized XI (heuristic). Enforces basic constraints (budget, max 3 per team).")
+
+        sim1, sim2, sim3 = st.columns([1, 1, 2])
+        with sim1:
+            sim_horizon = st.selectbox("Projection horizon (GWs)", [1, 2, 3, 4, 5, 6], index=2, key="sim_horizon")
+        with sim2:
+            sim_n = st.selectbox("Transfers to simulate", [1, 2, 3], index=0, key="sim_n")
+        with sim3:
+            sim_buffer = st.slider("Budget buffer (£m)", 0.0, 3.0, 0.5, 0.1, key="sim_buffer", help="Assumed available bank per transfer (approx).")
+
+        sim_squad = add_projection_columns(my_squad.copy(), horizon_gws=int(sim_horizon))
+        sim_pool = add_projection_columns(players.copy(), horizon_gws=int(sim_horizon))
+
+        # Team limit check helper
+        def _team_limit_ok(ids: list[int]) -> bool:
+            try:
+                teams_count = players[players["id"].isin(ids)]["team"].value_counts()
+                return bool((teams_count <= 3).all())
+            except Exception:
+                return True
+
+        transfers_chosen: list[dict] = []
+        current_ids = [int(x) for x in my_player_ids]
+        remaining_ids = current_ids.copy()
+
+        for i in range(int(sim_n)):
+            st.subheader(f"Transfer {i+1}")
+            s1, s2, s3 = st.columns([1, 1, 1])
+            with s1:
+                sell_name = st.selectbox(
+                    "Sell",
+                    options=sim_squad["web_name"].tolist(),
+                    index=min(i, max(0, len(sim_squad) - 1)),
+                    key=f"sim_sell_{i}",
+                )
+            sell_row = sim_squad[sim_squad["web_name"] == sell_name].head(1)
+            if sell_row.empty:
+                continue
+            sell_id = int(sell_row.iloc[0]["id"])
+            sell_pos = str(sell_row.iloc[0]["pos"])
+            sell_price = float(sell_row.iloc[0]["price"])
+            max_price = sell_price + float(sim_buffer)
+
+            candidates = sim_pool[
+                (sim_pool["pos"] == sell_pos)
+                & (sim_pool["price"] <= max_price)
+                & (~sim_pool["id"].isin(remaining_ids))
+            ].copy()
+            candidates = candidates.sort_values(["proj_pts", "play_prob"], ascending=[False, False]).head(100)
+            buy_options = candidates["web_name"].tolist()
+
+            with s2:
+                buy_name = st.selectbox(
+                    "Buy",
+                    options=buy_options if buy_options else ["— No candidates —"],
+                    index=0,
+                    key=f"sim_buy_{i}",
+                )
+            if not buy_options or buy_name == "— No candidates —":
+                st.info("No valid buy candidates under current filters/budget.")
+                continue
+
+            buy_row = candidates[candidates["web_name"] == buy_name].head(1)
+            if buy_row.empty:
+                continue
+            buy_id = int(buy_row.iloc[0]["id"])
+
+            # Preview constraint check
+            proposed_ids = [pid for pid in remaining_ids if pid != sell_id] + [buy_id]
+            with s3:
+                ok = _team_limit_ok(proposed_ids)
+                st.metric("Team-limit OK", "Yes" if ok else "No", help="FPL limit: max 3 players per real team.")
+                if not ok:
+                    st.warning("This move breaks the 3-per-team rule.")
+
+            transfers_chosen.append(
+                {
+                    "Sell": sell_name,
+                    "Buy": buy_name,
+                    "Sell id": sell_id,
+                    "Buy id": buy_id,
+                    "Pos": sell_pos,
+                    "Budget £m": round(max_price, 1),
+                    "Δ proj": round(float(buy_row.iloc[0]["proj_pts"]) - float(sell_row.iloc[0]["proj_pts"]), 1),
+                    "Buy play_prob": float(buy_row.iloc[0]["play_prob"]),
+                    "Buy variance": str(buy_row.iloc[0].get("variance_flags", "—")),
+                }
+            )
+
+            # Apply sequentially (so later transfers can't buy already bought players)
+            remaining_ids = proposed_ids
+
+        if transfers_chosen:
+            st.markdown("---")
+            sim_df = pd.DataFrame(transfers_chosen)
+            st.dataframe(sim_df, width="stretch", hide_index=True)
+
+            # Before/After optimized XI delta
+            before = add_projection_columns(my_squad.copy(), horizon_gws=int(sim_horizon))
+            after = add_projection_columns(players[players["id"].isin(remaining_ids)].copy(), horizon_gws=int(sim_horizon))
+
+            try:
+                from fpl.logic import optimize_starting_xi as _opt_xi  # type: ignore
+                before_xi, _ = _opt_xi(before, score_col="proj_pts", pos_col="pos")
+                after_xi, _ = _opt_xi(after, score_col="proj_pts", pos_col="pos")
+            except Exception:
+                before_xi = before.sort_values("proj_pts", ascending=False).head(11).copy()
+                after_xi = after.sort_values("proj_pts", ascending=False).head(11).copy()
+
+            b_pts = float(pd.to_numeric(before_xi["proj_pts"], errors="coerce").fillna(0.0).sum()) if "proj_pts" in before_xi.columns else 0.0
+            a_pts = float(pd.to_numeric(after_xi["proj_pts"], errors="coerce").fillna(0.0).sum()) if "proj_pts" in after_xi.columns else 0.0
+            d_pts = round(a_pts - b_pts, 1)
+
+            k1, k2, k3 = st.columns(3)
+            k1.metric("XI projected (before)", round(b_pts, 1))
+            k2.metric("XI projected (after)", round(a_pts, 1))
+            k3.metric("Δ XI projected", d_pts)
+
+            st.subheader("Optimized XI — Before")
+            st.dataframe(get_display_df(before_xi, xi_cols), width="stretch", hide_index=True)
+            st.subheader("Optimized XI — After")
+            st.dataframe(get_display_df(after_xi, xi_cols), width="stretch", hide_index=True)
     else:
         st.info("Enter your Manager ID in the sidebar to use the Transfer Optimizer.")
 
@@ -2448,7 +2889,7 @@ with tabs[10]:
         pc1, pc2 = st.columns([1, 2])
         with pc1:
             st.markdown("**Budget by position**")
-            st.dataframe(_pos_cost, use_container_width=True, hide_index=True)
+            st.dataframe(_pos_cost, width="stretch", hide_index=True)
         with pc2:
             _pos_order = ['GKP', 'DEF', 'MID', 'FWD']
             _cost_ordered = _pos_cost.set_index('Pos').reindex(_pos_order).dropna()
@@ -2462,7 +2903,7 @@ with tabs[10]:
                 yaxis_title="£m", margin=dict(l=20, r=20, t=20, b=20),
                 showlegend=False,
             )
-            st.plotly_chart(fig_wc_budget, use_container_width=True)
+            st.plotly_chart(fig_wc_budget, width="stretch")
 
         # Squad rows by position
         _sq_display_cols = [
@@ -2485,7 +2926,7 @@ with tabs[10]:
                 _cols.insert(-1, 'cs_prob')
             _pos_total = _pos_df['price'].sum()
             st.markdown(f"**{_pos_label}** — {len(_pos_df)} players · £{_pos_total:.1f}m")
-            st.dataframe(get_display_df(_pos_df, _cols), use_container_width=True, hide_index=True)
+            st.dataframe(get_display_df(_pos_df, _cols), width="stretch", hide_index=True)
 
         st.download_button(
             "Download Squad CSV",
